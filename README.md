@@ -74,7 +74,7 @@ docker run --rm --entrypoint grep sakurajiamai/sillytavernmod:latest -c enableRe
 | 项目 | 要求 |
 |------|------|
 | 操作系统 | 云服务器推荐 Linux（镜像支持 amd64 / arm64）；方式 C 也可在 Windows / macOS 上运行 |
-| Node.js（仅方式 C） | `package.json` 要求 `>= 20`；直接运行请使用 **22.x LTS**（本文命令在 Node 22 上实测通过）。Node 20 已于 2026 年 4 月停止维护，不建议新装。Docker 镜像基于 `node:23-alpine` 构建，自带 Node 23（不是 LTS 版本），无需另装 |
+| Node.js（仅方式 C） | `package.json` 要求 `>= 20`；直接运行请使用 **22.x LTS**（本文命令在 Node 22 上实测通过）。Node 20 已于 2026 年 4 月停止维护，不建议新装。Docker 镜像基于 `node:22-alpine`（Node 22 LTS）构建，自带 Node，无需另装 |
 | Docker（方式 A / B / D） | Docker Engine 与 `docker compose` 插件；本文命令在 Docker 29.5、Compose v5.1 上实测通过 |
 | Git（方式 B / C / D） | 用于获取和更新代码；方式 D 需要仓库中的 `docker-compose.s3.yml`、`docker/juicefs/` 等文件 |
 | 磁盘 | 镜像约 0.9 GB；源码加依赖约 0.6 GB；另需存放用户数据 |
@@ -133,7 +133,7 @@ docker compose logs -f sillytavern   # 按 Ctrl+C 只是退出查看，容器继
 
 - **一定要加 `--build`**：`docker/docker-compose.yml` 同时写了 `build: ..` 和 `image: sakurajiamai/sillytavernmod:latest`。不加 `--build` 时，本机没有该镜像就从 Docker Hub 拉取，本机已有就直接用已有的旧镜像；两种情况都**不会**使用你刚下载或更新的源码。
 - 本地构建出的镜像同样叫 `sakurajiamai/sillytavernmod:latest`。方式 B 下不要执行 `docker compose pull` 或 `docker pull`，否则会换回 Docker Hub 版本（再执行一次 `docker compose up -d --build` 即可恢复）。
-- 首次构建要下载 `node:23-alpine` 基础镜像和 npm 依赖并编译前端库，实测约 1 分钟起，视网络而定。
+- 首次构建要下载 `node:22-alpine` 基础镜像和 npm 依赖并编译前端库，实测约 1 分钟起，视网络而定。
 - 数据目录位于 `SillyTavernMOD/docker/` 下的 `config/`、`data/`、`plugins/`、`extensions/`，用途与方式 A 的挂载表相同。
 - 容器名同样是 `sillytavernmod`、端口同样是 `8000`，**不要与方式 A 同时使用**。
 - Compose 文件自带健康检查和心跳（`SILLYTAVERN_HEARTBEATINTERVAL=30`），`docker compose ps` 中应显示 `healthy`。
