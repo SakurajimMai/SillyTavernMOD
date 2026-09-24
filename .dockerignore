@@ -12,6 +12,10 @@
 /docker/data
 /docker/plugins
 /docker/dist
+# STC-MOD: S3 (JuiceFS) stack — the mount point must never enter the build context
+/docker/docker-compose.s3.yml
+/docker/s3.env
+/docker/juicefs
 # Do NOT exclude public/scripts/extensions/third-party: STC-MOD ships stc-admin-panel there and it must be in the image.
 # (Upstream SillyTavern often excludes this path so users mount extensions; empty mounts would otherwise need seeding — see docker-entrypoint.sh.)
 

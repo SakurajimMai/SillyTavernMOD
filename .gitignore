@@ -62,3 +62,9 @@ test-results/
 
 !public/scripts/extensions/third-party/stc-admin-panel/
 !public/scripts/extensions/third-party/stc-admin-panel/**
+
+# STC-MOD: S3 (JuiceFS) runtime state and credentials
+/docker/s3.env
+/docker/juicefs/mnt
+/docker/juicefs/cache
+/docker/juicefs/redis

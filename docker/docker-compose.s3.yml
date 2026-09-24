@@ -1,0 +1,110 @@
+# STC-MOD: SillyTavern with all user data stored on S3-compatible storage (R2 / B2 / ...) via JuiceFS.
+#
+#   cp s3.env.example s3.env   # fill in bucket, keys and metadata database
+#   docker compose -f docker-compose.s3.yml up -d                    # metadata in external MariaDB/MySQL
+#   docker compose -f docker-compose.s3.yml --profile redis up -d    # metadata in the bundled local Redis
+#
+# Layout:
+#   juicefs     - Mounts the volume at ./juicefs/mnt/fs (file contents in the bucket, file tree in JFS_META_URL).
+#   sillytavern - Uses ./juicefs/mnt/fs/data as its data root.
+#   redis       - Optional (profile "redis"): local metadata engine persisted to ./juicefs/redis.
+services:
+  redis:
+    profiles: ["redis"]
+    image: redis:7-alpine
+    container_name: sillytavernmod-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1"]
+    volumes:
+      - "./juicefs/redis:/data"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  juicefs:
+    image: juicedata/mount:ce-v1.4.1
+    container_name: sillytavernmod-juicefs
+    entrypoint: ["/bin/sh", "/juicefs-entrypoint.sh"]
+    env_file: ./s3.env
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - "./juicefs/entrypoint.sh:/juicefs-entrypoint.sh:ro"
+      - "./juicefs/cache:/var/jfsCache"
+      - type: bind
+        source: ./juicefs/mnt
+        target: /mnt/jfs-host
+        bind:
+          propagation: rshared
+          create_host_path: true
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qs ' /mnt/jfs-host/fs fuse.juicefs ' /proc/mounts"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+  sillytavern:
+    build: ..
+    container_name: sillytavernmod
+    hostname: sillytavernmod
+    image: zhaiker/sillytavernmod:latest
+    # Wait for the JuiceFS mount before starting, so data is never written to the local directory
+    # underneath it (depends_on is not honoured when Docker restarts containers after a reboot).
+    entrypoint:
+      - tini
+      - --
+      - sh
+      - -c
+      - |
+        until grep -qs ' /mnt/jfs/fs fuse.juicefs ' /proc/mounts; do
+          echo "Waiting for JuiceFS mount at /mnt/jfs/fs ..."
+          sleep 2
+        done
+        exec ./docker-entrypoint.sh "$$@"
+      - --
+
+    environment:
+      # Data root on the JuiceFS mount (also read by src/healthcheck.js)
+      - SILLYTAVERN_DATAROOT=/mnt/jfs/fs/data
+      - NODE_ENV=production
+      - FORCE_COLOR=1
+      - SILLYTAVERN_HEARTBEATINTERVAL=30
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - "./config:/home/node/app/config"
+      - "./plugins:/home/node/app/plugins"
+      - "./extensions:/home/node/app/public/scripts/extensions/third-party"
+      - type: bind
+        source: ./juicefs/mnt
+        target: /mnt/jfs
+        bind:
+          propagation: rslave
+          create_host_path: true
+
+    depends_on:
+      juicefs:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "node", "src/healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+    restart: unless-stopped
