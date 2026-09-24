@@ -59,7 +59,7 @@ services:
     build: ..
     container_name: sillytavernmod
     hostname: sillytavernmod
-    image: zhaiker/sillytavernmod:latest
+    image: sakurajiamai/sillytavernmod:latest
     # Wait for the JuiceFS mount before starting, so data is never written to the local directory
     # underneath it (depends_on is not honoured when Docker restarts containers after a reboot).
     entrypoint:

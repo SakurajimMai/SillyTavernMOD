@@ -313,7 +313,9 @@ app.use(express.static(path.join(serverDirectory, 'public'), {
 | `getAllUserHandles` | `user-extend.js`、`scheduled-tasks.js` | 获取所有用户 handle 列表 |
 | `getUserDirectories` | `user-extend.js` | 获取用户数据目录路径（用于清理数据） |
 | `toKey` | `user-extend.js` | 将 handle 转换为 node-persist 存储 key |
-| `getPasswordSalt` | `register-helper.js` | 生成密码盐 |
+| `getPasswordSalt` | `register-helper.js`、`services/account-security.js` | 生成密码盐 |
+| `getAccountVersion` | `oauth.js`、`set-password.js` | 第三方登录/改密后写入 `session.version`（与官方登录一致） |
+| `getIpAddress`、`retryAfter`（`src/express-common.js`） | `index.js`、`register.js` | 限流按 IP 计数（与官方登录限流同源） |
 | `getPasswordHash` | `register-helper.js` | 生成密码哈希 |
 | `ensurePublicDirectoriesExist` | `register-helper.js` | 确保用户公共目录存在 |
 | `shouldRedirectToLogin` | 官方 `server-main.js`（参考） | 判断是否需要跳转登录 |
@@ -339,13 +341,12 @@ src/stc-mod/
 │   │   ├── email-status.js          # 邮件服务状态
 │   │   └── public-config.js         # 公开配置（功能开关）
 │   └── private/
+│       ├── registration-config.js   # 注册开关（管理员）
 │       ├── invitation-codes.js      # 邀请码管理（管理员）
 │       ├── user-extend.js           # 用户扩展（续费、存储、签到）
 │       ├── announcements.js         # 公告管理（管理员）
 │       ├── email-config.js          # 邮件配置（管理员）
 │       ├── oauth-config.js          # OAuth 配置（管理员）
-│       ├── forum.js                 # 社区论坛
-│       ├── public-characters.js     # 公共角色卡库
 │       ├── system-load.js           # 系统监控（管理员）
 │       ├── user-storage.js          # 存储空间管理（管理员）
 │       ├── privacy-vault.js         # API 密钥保险箱（用户）
@@ -358,13 +359,12 @@ src/stc-mod/
 │   ├── system-monitor.js            # 系统监控
 │   ├── storage-quota.js             # 存储配额
 │   ├── privacy-vault.js             # API 密钥保险箱（用户口令加密）
+│   ├── site-config.js               # 页面背景与站点信息（config.yaml `site`，校验 + 页面注入）
 │   └── default-template.js          # 默认用户模板
 └── public/
     ├── login.html                   # 自定义登录页（含 OAuth 按钮）
     ├── register.html                # 注册页
-    ├── welcome.html                 # 欢迎页
-    ├── forum.html                   # 论坛页
-    └── public-characters.html       # 角色卡库页
+    └── welcome.html                 # 欢迎页
 ```
 
 ## 数据存储
@@ -377,8 +377,6 @@ src/stc-mod/
 | `invitation-codes.json` | 邀请码数据 |
 | `storage-codes.json` | 存储激活码数据 |
 | `announcements/` | 公告数据 |
-| `forum_data/` | 论坛帖子和图片 |
-| `public_characters/` | 公共角色卡索引和文件 |
 | `default-template/` | 新用户默认配置模板 |
 | `privacy-vaults/` | API 密钥保险箱元数据（不含明文密钥） |
 | `system-monitor-history.json` | 系统监控历史 |
@@ -389,8 +387,7 @@ src/stc-mod/
 
 ```yaml
 enableInvitationCodes: false    # 启用邀请码系统
-enableForum: false              # 启用论坛
-enablePublicCharacters: false   # 启用公共角色卡库
+enableRegistration: true        # 开放注册（false：隐藏注册入口并拒绝注册；QRole 会员首次登录仍自动开户）
 purchaseLink: ''                # 续费购买链接
 
 oauth:
@@ -409,6 +406,22 @@ oauth:
     clientId: ''
     clientSecret: ''
     callbackUrl: ''
+  qrole:                         # QRole（qqy.one）会员登录
+    enabled: false
+    clientId: ''
+    clientSecret: ''
+    callbackUrl: ''              # 反代部署时务必填写完整 https 回调地址
+    authUrl: 'https://www.qqy.one/api/oauth/authorize'
+    tokenUrl: 'https://www.qqy.one/api/oauth/token'
+    userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo'
+    scope: 'openid profile email'
+    tokenAuthMethod: client_secret_post   # 或 client_secret_basic
+    usePkce: true
+    requireMembership: true      # 仅允许 allowedTiers 中的会员登录
+    allowedTiers: [vip, svip]    # 由 STC 自动写入；default/config.yaml 中不预置数组（避免 lodash 按下标合并）
+    tierClaims: [membershipTierId, membership_tier, membership.tierId, membership.tier, tier]
+    expiryClaims: [membershipExpiresAt, membership_expires_at, membership.expiresAt]
+    reverifyHours: 24            # 会员状态复核间隔（小时），0 = 仅按已知到期时间/等级
 
 email:
   enabled: false
@@ -433,6 +446,25 @@ privacy:
 
 deployment:
   trustProxy: false                  # false = 不信任反代（默认）；1 = 单层；2 = 双层；'cloudflare' = 仅信任 CF IP 段；true = 信任全部
+
+site:                                # 欢迎页 / 登录页 / 注册页的站点信息与背景（刷新页面即生效）
+  name: 'SillyTavern'                # 网页标题、欢迎页大标题、登录框 Logo 旁文字（≤60）
+  badge: 'Silly Tavern'              # 欢迎页角标（≤60，'' 隐藏）
+  subtitle: 'AI 角色扮演与对话平台'     # ≤120，'' 隐藏
+  subtitle2: 'Creative · Immersive · Extensible'
+  logoUrl: 'img/logo.png'            # 站内相对路径或 http(s)
+  background:
+    pcVideoUrl: 'https://t.alcy.cc/acg'        # 电脑端背景视频（mp4）；'' = 用 pcImageUrl
+    pcImageUrl: ''                             # 电脑端背景图片（有视频时作封面/视频失败时替代）
+    mobileImageUrl: 'https://t.alcy.cc/moemp'  # 手机端背景图片；'' = 用 pcImageUrl
+    fallback: 'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)'  # CSS 颜色/渐变
+    overlayOpacity: 0.52                       # 遮罩不透明度 0-1
+    sakura: true                               # 樱花动画
+  features:                          # 欢迎页功能卡片（≤8；[] = 不显示）；由 STC 自动写入，default/config.yaml 中仅为注释示例
+    - { icon: 'fa-solid fa-comments', title: 'AI 对话', text: '支持多种 LLM 模型' }
+    - { icon: 'fa-solid fa-masks-theater', title: '角色扮演', text: '丰富的角色卡系统' }
+    - { icon: 'fa-solid fa-palette', title: '个性化', text: '主题和界面定制' }
+    - { icon: 'fa-solid fa-puzzle-piece', title: '扩展', text: '强大的扩展生态' }
 ```
 
 **手动配置（无自动探测）**：
@@ -482,7 +514,8 @@ enableDownloadableTokenizers: false
 | POST | `/api/stc/users/renew-expired` | 过期用户续费 |
 | GET | `/api/stc/oauth/:provider` | 发起 OAuth 登录 |
 | GET | `/api/stc/oauth/:provider/callback` | OAuth 回调 |
-| POST | `/api/stc/oauth/complete-registration` | 完成 OAuth 注册（带邀请码） |
+| GET | `/api/stc/oauth/pending` | 查询服务端会话中待补全（需邀请码）的第三方身份 |
+| POST | `/api/stc/oauth/complete-registration` | 完成 OAuth 注册（仅接收 `{inviteCode}`，身份取自服务端会话；需 CSRF） |
 
 ### 私有 API（需认证）
 
@@ -503,6 +536,7 @@ enableDownloadableTokenizers: false
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
+| GET/POST | `/api/stc/registration-config/config` | 获取/设置开放注册（`{enableRegistration}`） |
 | POST | `/api/stc/invitation-codes/create` | 创建邀请码 |
 | GET | `/api/stc/invitation-codes/list` | 列出所有邀请码 |
 | POST | `/api/stc/invitation-codes/delete` | 删除邀请码 |
@@ -588,6 +622,66 @@ enableDownloadableTokenizers: false
 - `GET /login` → 应显示自定义登录页（含 OAuth 按钮）
 - `GET /register` → 应显示注册页
 - `GET /api/stc/public-config/public-pages` → 应返回 JSON（无需登录）
+
+## QRole 会员登录、注册开关与账号安全加固
+
+全部实现位于 `src/stc-mod/` 与 `stc-admin-panel/`，**未新增 `server-main.js` 钩子**（仍为 6 个）。
+
+| 文件 | 说明 |
+|------|------|
+| `routes/public/oauth.js` | 新增 `qrole` 提供商（PKCE S256、`client_secret_post/basic`）；state 与 PKCE verifier 绑定服务端会话、一次性、10 分钟有效；待补全身份存于 `req.session.stcOauthPending`，`complete-registration` 只接收 `{inviteCode}`；所有失败重定向 `/login?oauth_error=<固定代码>`；Linux.do 不再信任未验签 JWT；过期关联（官方删除后同名重建）自动清理 |
+| `services/qrole-membership.js` | 会员等级/到期/状态判定（字段路径可配置，缺失时拒绝） |
+| `services/qrole-session.js` | 会话持续校验：到期、等级被移除、超过 `reverifyHours`（页面 1 倍、API 2 倍宽限）即下线（API 401 `code: QROLE_MEMBERSHIP`，页面跳登录页） |
+| `services/registration.js` | `isRegistrationEnabled()` / 统一 403 `REGISTRATION_CLOSED` |
+| `services/account-security.js` | 随机密码（不可逆随机串）、`passwordAutoGenerated` 判定、过期元数据识别 `isMetaForRecord` |
+| `services/password-migration.js` | 首个请求前把无密码第三方账号加固为随机密码（批量、秒级）；日志列出仍无密码的本地账号与需管理员重置密码的账号 |
+| `routes/private/registration-config.js` | 管理员注册开关 API |
+| `index.js` | `setupPublicRoutes` 内：迁移闸门 → 挂在 `/api/users` 路由器上的登录拦截（与官方路由相同匹配语义，防 `//login` 绕过；缺省 password 视为空串）：QRole 会员账号禁止密码登录、无密码账号（`default-user` 除外）禁止仅凭用户名登录，拒绝按 IP 限流 → QRole 会话校验 → `/register` 在关闭注册时跳转 |
+| `routes/public/register.js` | 关闭注册时拒绝；密码必填 8–128；元数据先写再使用邀请码（修复限时码变永久）；`renew-expired` 统一错误、按 IP 限流、仅对已过期账号生效 |
+| `routes/public/register-helper.js` | 建号互斥锁；存在孤儿数据目录（官方删除未清数据）的用户名视为已占用；失败回滚 |
+| `routes/private/oauth-config.js` | 提供商白名单；GET 不再返回 `clientSecret`（只返回 `hasClientSecret`）；空 Secret 表示保持不变；一次原子写入 |
+| `routes/private/set-password.js`、`user-extend.js` | 随机密码账号可免旧密码设置密码；QRole 账号可设密码但不能用于登录；`/renew` 不会把永久账号降级为限时 |
+| `config.js` | 原子写入（保留 Docker 符号链接与权限）；YAML 解析失败时拒绝写入并沿用最后一次正确配置；键名防原型污染；`setStcConfigs` 批量写 |
+| `middleware/csrf-exemption.js` | 移除 `/api/stc/oauth*`、`/api/stc/users/register`、`/send-verification` 的 CSRF 豁免 |
+| `public/login.html`、`register.html`、`welcome.html` | QRole 按钮、按 `enableRegistration` 显示注册入口、固定文案的错误提示（`oauth_error` / `notice`）、修复 `?handle=` 反射型 XSS、购买链接仅允许 http(s) |
+| `stc-admin-panel/admin-panel.js`、`index.js` | OAuth 标签新增 QRole 配置；「注册设置」开关；密码安全卡片与 QRole 会话下线提示 |
+
+升级 SillyTavern 时需额外确认：官方 `POST /api/users/login` 仍挂在 `app.use('/api/users', …)` 下（QRole 密码登录拦截依赖相同挂载路径），`setUserDataMiddleware` 仍在 STC `setupPublicRoutes` 之前执行（会话校验依赖 `req.user`），`getAccountVersion` / `getPasswordSalt` 仍从 `src/users.js` 导出。
+
+## 页面背景与站点信息（`site` 配置）
+
+欢迎页 / 登录页 / 注册页原先写死的背景（`t.alcy.cc` 视频与图片、渐变底色、遮罩、樱花）与站点文字（标题、角标、副标题、Logo、功能卡片）改为读取 `config.yaml` 的 `site` 段，默认值与原页面完全一致。全部实现位于 `src/stc-mod/` 与 `default/config.yaml`，**未新增 `server-main.js` 钩子**（仍为 6 个）。
+
+| 文件 | 说明 |
+|------|------|
+| `services/site-config.js`（新增） | `SITE_DEFAULTS`（冻结）；`getSiteConfig()` 每次调用读取 `site` 并逐项校验（文字去控制字符、去首尾空格、超长截断；地址仅允许相对路径与 http(s)，拒绝 `javascript:` / `data:` 等；`fallback` 拒绝 `<>;{}\`、引号、`url(`、`expression(`；`overlayOpacity` 0–1（接受数字字符串）；`features` ≤ 8 且标题必填、图标须为 `fa-` 类名），无效值回落到该项默认值，从不抛错；`renderSitePage(fileName, pageKind)` 把首个 `<title>` 替换为 HTML 转义后的站点标题，并在 `</head>` 前注入 `<script>window.STC_SITE = {...};</script>`（JSON 中 `< > & U+2028 U+2029` 转义为 `\uXXXX`）；`sendSitePage()` 以 `text/html; charset=utf-8`、`Cache-Control: no-cache` 发送，渲染失败时记录日志并回退为原静态文件 |
+| `index.js` | `/`（未登录）、`/login`（未登录）、`/register`（开放注册时）改为 `sendSitePage(...)`；过期跳转、关闭注册跳转、已登录放行等条件不变 |
+| `config.js` | `ensureDefaultConfig` 增加 `site` 默认值（含 `features` 数组，仅在缺少该键时写入） |
+| `public/welcome.html`、`login.html`、`register.html` | 内置同样的 `STC_SITE_DEFAULTS`，读取 `window.STC_SITE`（经 `/stc-assets/` 直接访问时无注入则用默认值）；背景脚本按配置选择视频 / 图片 / 底色、遮罩透明度与樱花开关；站点文字一律用 `textContent` 写入，地址在前端再次校验 |
+| `default/config.yaml` | 新增带中文注释的 `site` 段；`features` 仅以注释示例给出（官方 `config-init` 的 lodash `defaultsDeep` 会按下标合并数组，把默认卡片追加到较短的自定义列表中） |
+
+升级 SillyTavern 时需额外确认：官方 `config-init` 仍只在缺失键时补默认值（`defaultsDeep`），`public/img/logo.png` 仍存在（默认 Logo）。
+
+## S3 存储部署（Docker）
+
+新增文件（不修改官方代码）：
+
+| 文件 | 作用 |
+|------|------|
+| `docker/docker-compose.s3.yml` | JuiceFS + SillyTavern（+ 可选 `--profile redis` 本地 Redis）；元数据默认走外部 MariaDB/MySQL（`JFS_META_URL`）；通过 `SILLYTAVERN_DATAROOT=/mnt/jfs/fs/data` 把数据根目录放到 JuiceFS |
+| `docker/juicefs/entrypoint.sh` | 首次运行 `juicefs format`（仅当元数据报告未格式化；桶内已有数据时 JuiceFS 拒绝格式化并提示恢复）；已格式化时每次启动 `juicefs config` 同步 `s3.env` 中的密钥；之后前台 `juicefs mount` |
+| `docker/juicefs/migrate-local-data.sh` | 把旧本地 `data/` 一次性复制进 JuiceFS（有运行中/挂载/非空目标检查） |
+| `docker/s3.env.example` | 存储桶与密钥模板（实际 `docker/s3.env` 已忽略） |
+
+`.dockerignore` 排除了 `docker/juicefs`：构建上下文是仓库根目录，若不排除，`docker build` 会遍历整个挂载的存储桶。
+依赖上游行为：`src/healthcheck.js` 与 `getConfigValue('dataRoot')` 均读取 `SILLYTAVERN_DATAROOT`；STC-MOD 的 `getDataRoot()` 使用 `globalThis.DATA_ROOT`。
+
+## 已移除功能
+
+- **社区论坛**（`/forum`、`/api/stc/forum/*`）与 **公共角色卡库**（`/public-characters`、`/api/stc/public-characters/*`）已整体移除：
+  论坛图片接口存在任意文件读取（路径穿越）与同源 HTML/SVG 上传，帖子内容存在存储型 XSS。
+  对应的 `enableForum` / `enablePublicCharacters` 配置项已废弃，旧 `config.yaml` 中残留该键无任何作用。
+  旧部署中的 `data/stc-mod/forum_data/`、`data/stc-mod/public_characters/` 不再被读取，可按需手动备份或删除。
 
 ## 延迟功能
 

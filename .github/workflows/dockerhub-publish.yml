@@ -1,12 +1,13 @@
 # 每次往默认分支（release）推送代码，或手动触发，
 # 都会构建多架构镜像并推送到 Docker Hub：
-#   zhaiker/sillytavernmod:latest
-#   zhaiker/sillytavernmod:release-<short-sha>
+#   sakurajiamai/sillytavernmod:latest
+#   sakurajiamai/sillytavernmod:release-<short-sha>
 #
-# 首次使用前，请在本仓库的 GitHub 设置里添加两个 Secrets：
-#   DOCKERHUB_USERNAME = zhaiker
-#   DOCKERHUB_TOKEN    = 在 https://hub.docker.com/settings/security 生成的 Access Token
-#                        （至少 Read/Write 权限；不要使用登录密码）
+# 首次使用前，请在本仓库 Settings → Secrets and variables → Actions 里添加两个 Secrets：
+#   DOCKERHUB_USERNAME = sakurajiamai
+#   DOCKERHUB_TOKEN    = 在 https://app.docker.com/settings/personal-access-tokens 生成的 Access Token
+#                        （权限选 Read & Write；不要使用登录密码）
+# 未配置这两个 Secrets 时，工作流会跳过发布（显示警告），不会失败。
 
 name: Publish to Docker Hub
 
@@ -28,33 +29,51 @@ concurrency:
 
 jobs:
   build-and-push:
-    # 仅在我们自己的仓库里跑，fork 出去的仓库默认跳过（避免别人的 PR 意外触发）
-    if: github.repository == 'zhaiiker/SillyTavernMOD'
+    # 仅在本仓库里跑，fork 出去的仓库默认跳过（避免别人的 PR 意外触发）
+    if: github.repository == 'SakurajimMai/SillyTavernMOD'
     runs-on: ubuntu-latest
     permissions:
       contents: read
 
     steps:
+      - name: Check Docker Hub secrets
+        id: secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::warning::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，跳过镜像发布（在仓库 Settings → Secrets and variables → Actions 中添加后重新运行）"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout source
+        if: steps.secrets.outputs.ok == 'true'
         uses: actions/checkout@v4
 
       - name: Set up QEMU (for arm64 emulation)
+        if: steps.secrets.outputs.ok == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        if: steps.secrets.outputs.ok == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
+        if: steps.secrets.outputs.ok == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Compute image tags
+        if: steps.secrets.outputs.ok == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: zhaiker/sillytavernmod
+          images: sakurajiamai/sillytavernmod
           # latest       → 每次 release 分支构建都覆盖（给普通用户用）
           # release-sha7 → 每次构建生成的稳定回溯标签
           # <input.tag>  → 手动触发时可以再补一个标签（例如 "v2026.05"）
@@ -64,11 +83,12 @@ jobs:
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
           labels: |
             org.opencontainers.image.title=SillyTavernMOD (STC-MOD)
-            org.opencontainers.image.description=SillyTavern 1.18.0 fork with SillyTavernchat (STC-MOD) sidecar features.
-            org.opencontainers.image.source=https://github.com/zhaiiker/SillyTavernMOD
+            org.opencontainers.image.description=SillyTavern 1.19.0 fork with SillyTavernchat (STC-MOD) sidecar features.
+            org.opencontainers.image.source=https://github.com/SakurajimMai/SillyTavernMOD
             org.opencontainers.image.licenses=AGPL-3.0
 
       - name: Build and push multi-arch image
+        if: steps.secrets.outputs.ok == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -82,6 +102,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Summary
+        if: steps.secrets.outputs.ok == 'true'
         run: |
           echo "### Published images" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -90,5 +111,5 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Users can update with:" >> "$GITHUB_STEP_SUMMARY"
           echo '```bash' >> "$GITHUB_STEP_SUMMARY"
-          echo 'docker pull zhaiker/sillytavernmod:latest' >> "$GITHUB_STEP_SUMMARY"
+          echo 'docker pull sakurajiamai/sillytavernmod:latest' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
