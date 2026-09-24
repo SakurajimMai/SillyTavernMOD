@@ -10,18 +10,16 @@ const EXEMPT_PATHS = [
     '/api/stc/users/use-storage-code',
     '/api/stc/users/renew',
     '/api/stc/users/renew-expired',
-    '/api/stc/users/register',
-    '/api/stc/users/send-verification',
     '/api/stc/invitation-codes/status',
-    '/api/stc/oauth',
     '/api/stc/email/status',
     '/api/stc/announcements/login',
     '/api/stc/announcements/current',
 ];
 
-const EXEMPT_PREFIXES = [
-    '/api/stc/oauth/',
-];
+// Note: /api/stc/oauth/* (complete-registration), /api/stc/users/register and
+// /api/stc/users/send-verification are intentionally NOT exempt; register.html sends X-CSRF-Token.
+/** @type {string[]} */
+const EXEMPT_PREFIXES = [];
 
 /**
  * Check if a request should skip CSRF protection

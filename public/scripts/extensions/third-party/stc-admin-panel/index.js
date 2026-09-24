@@ -80,8 +80,38 @@ async function getCsrfHeaders() {
         return `${actionLabel}失败（HTTP ${response.status}）。请打开浏览器开发者工具 → Network 查看对应请求详情。`;
     }
 
+    // QRole session guard (401 code QROLE_MEMBERSHIP): the server already ended the session
+    const QROLE_SESSION_MESSAGES = {
+        membership_expired: '您的 QRole 会员已过期，续费后即可登录',
+        not_member: '仅 QRole VIP / SVIP 会员可以登录',
+        membership_reverify: '为确认会员状态，请重新使用 QRole 登录',
+    };
+    let qroleRedirectPending = false;
+
+    async function handleQroleSessionEnd(response) {
+        if (qroleRedirectPending) return;
+        let body = null;
+        try {
+            body = await response.json();
+        } catch {
+            return;
+        }
+        if (body?.code !== 'QROLE_MEMBERSHIP' || !Object.hasOwn(QROLE_SESSION_MESSAGES, body.reason)) return;
+
+        qroleRedirectPending = true;
+        toastr?.warning?.(`${QROLE_SESSION_MESSAGES[body.reason]}，即将跳转到登录页…`, '', { timeOut: 4000 });
+        setTimeout(() => {
+            window.location.href = '/login?oauth_error=' + encodeURIComponent(body.reason);
+        }, 4000);
+    }
+
     window.fetch = async function (...args) {
         const resp = await _fetch(...args);
+
+        if (resp.status === 401) {
+            handleQroleSessionEnd(resp.clone());
+            return resp;
+        }
 
         if (resp.status === 507) {
             const clone = resp.clone();
@@ -248,6 +278,7 @@ async function showPasswordReminderPopup(info) {
     // Only show for OAuth users without password
     if (!info?.oauthProvider) return; // not OAuth user
     if (info.hasPassword) return; // already has password
+    if (info.passwordLoginAllowed === false) return; // QRole members must use QRole login
 
     try {
         const { Popup, POPUP_TYPE } = await import('/scripts/popup.js');
@@ -256,8 +287,9 @@ async function showPasswordReminderPopup(info) {
             github: 'GitHub',
             discord: 'Discord',
             linuxdo: 'Linux.do',
+            qrole: 'QRole',
         };
-        const providerName = providerNames[info.oauthProvider] || info.oauthProvider;
+        const providerName = esc(providerNames[info.oauthProvider] || info.oauthProvider);
 
         const content = document.createElement('div');
         content.style.cssText = 'display:flex;flex-direction:column;gap:14px;width:100%';
@@ -822,7 +854,7 @@ function buildUserPanelContent(purchaseLink = '') {
     wrap.style.cssText = `display:flex;flex-direction:column;gap:14px;width:100%;min-width:${isNarrowMobile ? '0' : '300px'};max-width:100%;box-sizing:border-box;overflow-x:hidden`;
 
     // ━━━━ 1. Header ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    const oauthIcons = { github: 'fa-brands fa-github', discord: 'fa-brands fa-discord', linuxdo: 'fa-solid fa-globe' };
+    const oauthIcons = { github: 'fa-brands fa-github', discord: 'fa-brands fa-discord', linuxdo: 'fa-solid fa-globe', qrole: 'fa-solid fa-crown' };
     const oauthIcon = me.oauthProvider ? (oauthIcons[me.oauthProvider] || 'fa-solid fa-link') : null;
     const accountBadge = me.oauthProvider
         ? `<i class="${oauthIcon}" style="font-size:.85em"></i> ${esc(me.oauthProvider)} 账号`
@@ -1443,10 +1475,15 @@ async function wirePasswordCard(content, showMsg, parentPopup) {
             return b;
         };
 
-        if (!status.hasPassword) {
+        if (status.passwordLoginAllowed === false) {
+            // QRole members: login stays QRole-only (VIP gate); the password only confirms actions like data reset
+            if (status.hasPassword) mkBtn('stc-password-change-btn', '修改密码', 'fa-key');
+            else mkBtn('stc-password-set-btn', '设置密码', 'fa-lock');
+            hintEl.textContent = '登录请使用 QRole；可设置密码，仅用于重置数据等确认操作';
+        } else if (!status.hasPassword) {
             mkBtn('stc-password-set-btn', '设置密码', 'fa-lock');
             if (status.registrationMethod && status.registrationMethod !== 'local') {
-                hintEl.innerHTML = `您当前通过 <strong>${status.registrationMethod}</strong> 登录。设置密码后，下次可使用用户名和密码登录。`;
+                hintEl.innerHTML = `您当前通过 <strong>${esc(status.registrationMethod)}</strong> 登录。设置密码后，下次可使用用户名和密码登录。`;
             } else {
                 hintEl.innerHTML = '设置密码后，您可以使用用户名和密码登录。';
             }
@@ -1464,7 +1501,9 @@ async function wirePasswordCard(content, showMsg, parentPopup) {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const status = await r.json();
 
-            if (!status.hasPassword) {
+            if (status.passwordLoginAllowed === false) {
+                setBadge('<i class="fa-solid fa-crown"></i> QRole 登录', '#e91e63', 'rgba(233,30,99,.1)', 'rgba(233,30,99,.3)');
+            } else if (!status.hasPassword) {
                 setBadge('<i class="fa-solid fa-circle-exclamation"></i> 未设置', '#f39c12', 'rgba(243,156,18,.1)', 'rgba(243,156,18,.3)');
             } else {
                 setBadge('<i class="fa-solid fa-circle-check"></i> 已设置', '#2ecc71', 'rgba(46,204,113,.12)', 'rgba(46,204,113,.3)');
@@ -1493,7 +1532,7 @@ async function wirePasswordCard(content, showMsg, parentPopup) {
             ${requireOld ? `<input id="${oldId}" type="password" class="text_pole" autocomplete="current-password"
                 placeholder="当前密码" style="margin-bottom:6px">` : ''}
             <input id="${pwId}" type="password" class="text_pole" autocomplete="new-password"
-                placeholder="新密码（至少 8 位）">
+                placeholder="新密码（8-128 个字符）">
             ${confirm ? `<input id="${cfId}" type="password" class="text_pole" style="margin-top:6px" autocomplete="new-password"
                 placeholder="再次输入新密码">` : ''}`;
 
@@ -1511,16 +1550,19 @@ async function wirePasswordCard(content, showMsg, parentPopup) {
 
         const result = await popup.show();
         if (result !== POPUP_RESULT.AFFIRMATIVE) return null;
-        if (newPw.length < 8) { toastr.error('密码长度至少需要 8 个字符。'); return null; }
+        if (newPw.length < 8 || newPw.length > 128) { toastr.error('密码长度需为 8-128 个字符。'); return null; }
         if (confirm && newPw !== cfPw) { toastr.error('两次输入的密码不一致。'); return null; }
         return { oldPassword: oldPw, password: newPw };
     };
 
     const wirePasswordButtons = (status) => {
+        const qroleOnly = status.passwordLoginAllowed === false;
         card.querySelector('#stc-password-set-btn')?.addEventListener('click', async () => {
             const pw = await askPassword({
                 title: '设置密码',
-                message: '请设置一个密码用于登录。密码长度至少 8 位。',
+                message: qroleOnly
+                    ? '请设置一个密码，仅用于重置数据等确认操作（登录仍需使用 QRole）。密码长度需为 8-128 个字符。'
+                    : '请设置一个密码用于登录。密码长度需为 8-128 个字符。',
                 confirm: true,
             });
             if (!pw) return;
@@ -1535,10 +1577,15 @@ async function wirePasswordCard(content, showMsg, parentPopup) {
                 // Update global userExtInfo to prevent reminder popup on next refresh
                 if (userExtInfo) {
                     userExtInfo.hasPassword = true;
+                    userExtInfo.passwordAutoGenerated = false;
                     userExtInfo.passwordSetAt = Date.now();
                 }
 
-                showMsg(`密码设置成功！<br><br>您的登录凭据：<br>• 用户名：<span style="color:#4a90e2;font-weight:700;font-size:1.05em">${esc(userExtInfo?.handle || '')}</span><br>• 密码：您刚才设置的密码<br><br>下次可使用用户名密码登录，无需依赖第三方服务。`);
+                if (qroleOnly) {
+                    showMsg('密码设置成功！该密码仅用于重置数据等确认操作，登录请继续使用 QRole。');
+                } else {
+                    showMsg(`密码设置成功！<br><br>您的登录凭据：<br>• 用户名：<span style="color:#4a90e2;font-weight:700;font-size:1.05em">${esc(userExtInfo?.handle || '')}</span><br>• 密码：您刚才设置的密码<br><br>下次可使用用户名密码登录，无需依赖第三方服务。`);
+                }
 
                 // Auto-refresh page after 2 seconds to re-establish session
                 setTimeout(() => {
@@ -1550,7 +1597,7 @@ async function wirePasswordCard(content, showMsg, parentPopup) {
         card.querySelector('#stc-password-change-btn')?.addEventListener('click', async () => {
             const pw = await askPassword({
                 title: '修改密码',
-                message: '请输入当前密码和新密码。',
+                message: '请输入当前密码和新密码（8-128 个字符）。',
                 requireOld: true,
                 confirm: true,
             });

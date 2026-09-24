@@ -35,7 +35,9 @@
         /* Prevent scrolling on desktop */
         @media (min-width: 1024px) {
             body {
-                overflow: hidden;
+                /* Vertical scroll so extra feature cards stay reachable on short laptop screens */
+                overflow-x: hidden;
+                overflow-y: auto;
             }
         }
 
@@ -117,6 +119,7 @@
             color: rgba(255, 170, 230, 0.75);
             margin-bottom: 16px;
             text-transform: uppercase;
+            max-width: 100%; overflow-wrap: anywhere;
         }
         .anime-badge::before, .anime-badge::after {
             content: '◈'; margin: 0 8px; color: rgba(200, 140, 255, 0.6);
@@ -145,10 +148,12 @@
             background: linear-gradient(135deg, #fff 20%, #d8a8ff 60%, #ffb0d8);
             -webkit-background-clip: text; -webkit-text-fill-color: transparent;
             margin-bottom: 8px;
+            overflow-wrap: anywhere;
         }
         .subtitle {
             position: relative; z-index: 1;
             color: rgba(255,255,255,.45); font-size: .88em; margin-bottom: 36px; line-height: 1.7;
+            overflow-wrap: anywhere;
         }
         .subtitle .sub2 { font-size: .82em; color: rgba(255,180,230,.35); letter-spacing: .06em; }
 
@@ -197,6 +202,7 @@
             border: 1px solid rgba(200,140,255,.1);
             border-radius: 14px; padding: 18px 14px;
             transition: all .2s;
+            min-width: 0; overflow-wrap: anywhere;
         }
         .feature:hover {
             background: rgba(200,100,255,.08);
@@ -215,32 +221,176 @@
 </head>
 <body>
 
-<!-- Adaptive background: image on mobile, video on PC -->
+<!-- Site settings (config.yaml → site). The server injects window.STC_SITE at the end of the head; when the page is served statically it is absent and these defaults apply. -->
 <script>
-(function(){
-    var mobile = window.matchMedia('(max-width:1023px)').matches ||
-        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-    var el = mobile ? document.createElement('img') : document.createElement('video');
-    el.id = 'stc-bg-video';
-    if (mobile) {
-        el.src = 'https://t.alcy.cc/moemp';
-        el.alt = '';
-    } else {
-        el.autoplay = true; el.muted = true; el.loop = true;
-        el.setAttribute('playsinline','');
-        var s = document.createElement('source');
-        s.src = 'https://t.alcy.cc/acg'; s.type = 'video/mp4';
-        el.appendChild(s);
+const STC_SITE_DEFAULTS = Object.freeze({
+    name: 'SillyTavern',
+    badge: 'Silly Tavern',
+    subtitle: 'AI 角色扮演与对话平台',
+    subtitle2: 'Creative · Immersive · Extensible',
+    logoUrl: 'img/logo.png',
+    background: Object.freeze({
+        pcVideoUrl: 'https://t.alcy.cc/acg',
+        pcImageUrl: '',
+        mobileImageUrl: 'https://t.alcy.cc/moemp',
+        fallback: 'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)',
+        overlayOpacity: 0.52,
+        sakura: true,
+    }),
+    features: Object.freeze([
+        Object.freeze({ icon: 'fa-solid fa-comments', title: 'AI 对话', text: '支持多种 LLM 模型' }),
+        Object.freeze({ icon: 'fa-solid fa-masks-theater', title: '角色扮演', text: '丰富的角色卡系统' }),
+        Object.freeze({ icon: 'fa-solid fa-palette', title: '个性化', text: '主题和界面定制' }),
+        Object.freeze({ icon: 'fa-solid fa-puzzle-piece', title: '扩展', text: '强大的扩展生态' }),
+    ]),
+});
+
+/* Merged per key over the defaults (a missing or invalid key keeps its default). The server already
+   normalizes these values; they are re-checked here as defense in depth and only ever used as
+   text / DOM properties, never as HTML. */
+const SITE = (function(defaults, injected) {
+    const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+    const raw = isObject(injected) ? injected : {};
+    const rawBg = isObject(raw.background) ? raw.background : {};
+    const defBg = defaults.background;
+
+    function text(value, fallback, max, allowEmpty) {
+        if (typeof value !== 'string') return fallback;
+        const v = Array.from(value.replace(/\p{Cc}/gu, '').trim()).slice(0, max).join('');
+        return (v || allowEmpty) ? v : fallback;
     }
-    el.addEventListener('error', function(){
-        var ov = document.getElementById('stc-bg-overlay');
-        if (ov) ov.style.background =
-            'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)';
-    });
-    document.currentScript.insertAdjacentElement('beforebegin', el);
-})();
+    // http(s) or relative (resolved against <base href="/">) only
+    function url(value, fallback, allowEmpty) {
+        if (typeof value !== 'string') return fallback;
+        const v = value.trim();
+        if (!v) return allowEmpty ? '' : fallback;
+        if (v.length > 1024) return fallback;
+        try {
+            const parsed = new URL(v, document.baseURI);
+            return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? v : fallback;
+        } catch {
+            return fallback;
+        }
+    }
+    // CSS color / gradient only
+    function cssBackground(value, fallback) {
+        if (typeof value !== 'string') return fallback;
+        const v = value.trim();
+        if (!v || v.length > 300 || /[<>;{}\\]/.test(v) || /url\(|expression\(/i.test(v)) return fallback;
+        return v;
+    }
+    function opacity(value, fallback) {
+        const n = typeof value === 'number' ? value
+            : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+        return (Number.isFinite(n) && n >= 0 && n <= 1) ? n : fallback;
+    }
+    function features(value, fallback) {
+        if (!Array.isArray(value)) return fallback;
+        const list = [];
+        for (const item of value) {
+            if (list.length >= 8) break;
+            if (!isObject(item)) continue;
+            const title = text(item.title, '', 30, true);
+            if (!title) continue;
+            const icon = typeof item.icon === 'string' ? item.icon.trim() : '';
+            list.push({
+                icon: (/^[a-z0-9 -]{1,60}$/.test(icon) && icon.includes('fa-')) ? icon : 'fa-solid fa-star',
+                title,
+                text: text(item.text, '', 80, true),
+            });
+        }
+        return list;
+    }
+
+    return {
+        name: text(raw.name, defaults.name, 60, false),
+        badge: text(raw.badge, defaults.badge, 60, true),
+        subtitle: text(raw.subtitle, defaults.subtitle, 120, true),
+        subtitle2: text(raw.subtitle2, defaults.subtitle2, 120, true),
+        logoUrl: url(raw.logoUrl, defaults.logoUrl, false),
+        background: {
+            pcVideoUrl: url(rawBg.pcVideoUrl, defBg.pcVideoUrl, true),
+            pcImageUrl: url(rawBg.pcImageUrl, defBg.pcImageUrl, true),
+            mobileImageUrl: url(rawBg.mobileImageUrl, defBg.mobileImageUrl, true),
+            fallback: cssBackground(rawBg.fallback, defBg.fallback),
+            overlayOpacity: opacity(rawBg.overlayOpacity, defBg.overlayOpacity),
+            sakura: typeof rawBg.sakura === 'boolean' ? rawBg.sakura : defBg.sakura,
+        },
+        features: features(raw.features, defaults.features),
+    };
+})(STC_SITE_DEFAULTS, window.STC_SITE);
 </script>
 <div id="stc-bg-overlay"></div>
+<!-- Adaptive background (config.yaml → site.background): image on mobile, video (or image) on PC -->
+<script>
+(function() {
+    const bg = SITE.background;
+    const overlay = document.getElementById('stc-bg-overlay');
+    const mobile = window.matchMedia('(max-width:1023px)').matches ||
+        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+
+    // Overlay keeps its rgb(6, 3, 20) tint; only the alpha is configurable
+    if (overlay) overlay.style.background = 'rgba(6, 3, 20, ' + (Math.round(bg.overlayOpacity * 1000) / 1000) + ')';
+
+    let fallbackShown = false;
+    function showFallback() {
+        if (!overlay || fallbackShown) return;
+        fallbackShown = true;
+        overlay.style.background = '';
+        overlay.style.background = bg.fallback;
+        // A value the browser rejects leaves the style empty: use the built-in gradient instead
+        if (!overlay.style.background) overlay.style.background = STC_SITE_DEFAULTS.background.fallback;
+    }
+
+    let src = '';
+    let isVideo = false;
+    if (mobile) {
+        src = bg.mobileImageUrl || bg.pcImageUrl;
+    } else if (bg.pcVideoUrl) {
+        src = bg.pcVideoUrl;
+        isVideo = true;
+    } else {
+        src = bg.pcImageUrl;
+    }
+    if (!src) {
+        showFallback();
+        return;
+    }
+
+    let el;
+    function onVideoError() {
+        // Video failed: show the PC image instead when configured, otherwise the fallback
+        if (!bg.pcImageUrl || !el || el.tagName !== 'VIDEO') return showFallback();
+        const img = document.createElement('img');
+        img.id = 'stc-bg-video';
+        img.alt = '';
+        img.addEventListener('error', showFallback);
+        img.src = bg.pcImageUrl;
+        el.replaceWith(img);
+        el = img;
+    }
+    if (isVideo) {
+        el = document.createElement('video');
+        el.autoplay = true; el.muted = true; el.loop = true;
+        el.setAttribute('playsinline', '');
+        // pcImageUrl is shown while the video loads and replaces it if the video fails
+        if (bg.pcImageUrl) el.poster = bg.pcImageUrl;
+        const s = document.createElement('source');
+        s.src = src; s.type = 'video/mp4';
+        // A failing <source> fires "error" on the <source> itself, not on the <video>
+        s.addEventListener('error', onVideoError);
+        el.appendChild(s);
+    } else {
+        el = document.createElement('img');
+        el.src = src;
+        el.alt = '';
+    }
+    el.id = 'stc-bg-video';
+    el.addEventListener('error', isVideo ? onVideoError : showFallback);
+    if (overlay) overlay.insertAdjacentElement('beforebegin', el);
+    else document.currentScript.insertAdjacentElement('beforebegin', el);
+})();
+</script>
 <canvas id="stc-sakura"></canvas>
 
 <!-- Card -->
@@ -264,7 +414,8 @@
 
     <div class="btn-group">
         <a href="/login"    class="btn btn-primary"><i class="fa-solid fa-right-to-bracket"></i> 登录账号</a>
-        <a href="/register" class="btn btn-secondary"><i class="fa-solid fa-user-plus"></i> 注册新账号</a>
+        <!-- Hidden until public config confirms registration is open -->
+        <a id="stc-register-btn" href="/register" class="btn btn-secondary" style="display:none;"><i class="fa-solid fa-user-plus"></i> 注册新账号</a>
     </div>
 
     <div class="features">
@@ -276,9 +427,81 @@
 </div>
 
 <script>
+/* ── Site info (config.yaml → site): text nodes / DOM properties only, never innerHTML ── */
+(function() {
+    const card = document.querySelector('.card');
+    if (!card) return;
+
+    const badge = card.querySelector('.anime-badge');
+    if (badge) {
+        badge.textContent = SITE.badge;
+        badge.style.display = SITE.badge ? '' : 'none';
+    }
+
+    const logo = card.querySelector('.logo-wrap img');
+    if (logo) {
+        if (logo.getAttribute('src') !== SITE.logoUrl) logo.src = SITE.logoUrl;
+        logo.alt = SITE.name;
+    }
+
+    const title = card.querySelector('h1');
+    if (title) title.textContent = SITE.name;
+
+    const subtitle = card.querySelector('.subtitle');
+    if (subtitle) {
+        subtitle.replaceChildren();
+        if (SITE.subtitle) subtitle.appendChild(document.createTextNode(SITE.subtitle));
+        if (SITE.subtitle && SITE.subtitle2) subtitle.appendChild(document.createElement('br'));
+        if (SITE.subtitle2) {
+            const sub2 = document.createElement('span');
+            sub2.className = 'sub2';
+            sub2.textContent = SITE.subtitle2;
+            subtitle.appendChild(sub2);
+        }
+        subtitle.style.display = (SITE.subtitle || SITE.subtitle2) ? '' : 'none';
+    }
+
+    const grid = card.querySelector('.features');
+    if (grid) {
+        grid.replaceChildren();
+        for (const feature of SITE.features) {
+            const item = document.createElement('div');
+            item.className = 'feature';
+            const icon = document.createElement('i');
+            icon.className = feature.icon;
+            const heading = document.createElement('h3');
+            heading.textContent = feature.title;
+            item.append(icon, heading);
+            if (feature.text) {
+                const desc = document.createElement('p');
+                desc.textContent = feature.text;
+                item.appendChild(desc);
+            }
+            grid.appendChild(item);
+        }
+        grid.style.display = SITE.features.length ? '' : 'none';
+    }
+})();
+
+/* ── Register entry: shown only when registration is open ── */
+(async function() {
+    try {
+        const resp = await fetch('/api/stc/public-config/public-pages');
+        if (!resp.ok) return;
+        const config = await resp.json();
+        if (config && config.enableRegistration === true) {
+            document.getElementById('stc-register-btn').style.display = '';
+        }
+    } catch {}
+})();
+
 /* ── Sakura particles ── */
 (function() {
     const c = document.getElementById('stc-sakura');
+    if (!SITE.background.sakura) {
+        c.style.display = 'none';
+        return;
+    }
     const ctx = c.getContext('2d');
     const colors = ['#ffb7c5','#ffc8d4','#e8c4f8','#c4d8ff','#ffd8f0','#e0b8ff'];
     const petals = [];

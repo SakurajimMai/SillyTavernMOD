@@ -120,7 +120,7 @@
             -webkit-background-clip: text; -webkit-text-fill-color: transparent;
             margin-bottom: 6px;
         }
-        .card-header p { color: rgba(255,220,245,.35); font-size: .88em; }
+        .card-header p { color: rgba(255,220,245,.35); font-size: .88em; overflow-wrap: anywhere; }
 
         /* ── Loading overlay ── */
         #loadingOverlay {
@@ -215,11 +215,25 @@
 
         /* ── Config error banner ── */
         #configError {
-            display: none; padding: 12px 16px; border-radius: 9px; margin-bottom: 16px;
+            position: relative; z-index: 1;
+            padding: 12px 16px; border-radius: 9px; margin-bottom: 16px;
             background: rgba(231,76,60,.08); border: 1px solid rgba(231,76,60,.25); color: #f08080;
             font-size: .84em; text-align: center;
         }
         #configError a { color: #f08080; }
+
+        /* ── Page notices (registration closed / OAuth sign-up expired) ── */
+        .page-notice {
+            position: relative; z-index: 1;
+            padding: 20px 18px 18px; border-radius: 12px; margin-bottom: 4px;
+            background: rgba(220,160,50,.08); border: 1px solid rgba(220,160,50,.28); color: #f5d888;
+            text-align: center; font-size: .88em; line-height: 1.6;
+        }
+        .page-notice.error { background: rgba(231,76,60,.08); border-color: rgba(231,76,60,.25); color: #f08080; }
+        .page-notice > i { display: block; font-size: 1.7em; margin-bottom: 8px; }
+        .page-notice .notice-title { font-weight: 700; font-size: 1.05em; margin-bottom: 4px; }
+        .page-notice .notice-text { color: rgba(255,220,245,.45); font-size: .92em; margin-bottom: 16px; }
+        .page-notice .btn { text-decoration: none; width: 100%; }
 
         /* ── Password strength bar ── */
         #pwdStrengthBar {
@@ -257,32 +271,176 @@
 </head>
 <body>
 
-<!-- Adaptive background: image on mobile, video on PC -->
+<!-- Site settings (config.yaml → site). The server injects window.STC_SITE at the end of the head; when the page is served statically it is absent and these defaults apply. -->
 <script>
-(function(){
-    var mobile = window.matchMedia('(max-width:1023px)').matches ||
-        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-    var el = mobile ? document.createElement('img') : document.createElement('video');
-    el.id = 'stc-bg-video';
-    if (mobile) {
-        el.src = 'https://t.alcy.cc/moemp';
-        el.alt = '';
-    } else {
-        el.autoplay = true; el.muted = true; el.loop = true;
-        el.setAttribute('playsinline','');
-        var s = document.createElement('source');
-        s.src = 'https://t.alcy.cc/acg'; s.type = 'video/mp4';
-        el.appendChild(s);
+const STC_SITE_DEFAULTS = Object.freeze({
+    name: 'SillyTavern',
+    badge: 'Silly Tavern',
+    subtitle: 'AI 角色扮演与对话平台',
+    subtitle2: 'Creative · Immersive · Extensible',
+    logoUrl: 'img/logo.png',
+    background: Object.freeze({
+        pcVideoUrl: 'https://t.alcy.cc/acg',
+        pcImageUrl: '',
+        mobileImageUrl: 'https://t.alcy.cc/moemp',
+        fallback: 'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)',
+        overlayOpacity: 0.52,
+        sakura: true,
+    }),
+    features: Object.freeze([
+        Object.freeze({ icon: 'fa-solid fa-comments', title: 'AI 对话', text: '支持多种 LLM 模型' }),
+        Object.freeze({ icon: 'fa-solid fa-masks-theater', title: '角色扮演', text: '丰富的角色卡系统' }),
+        Object.freeze({ icon: 'fa-solid fa-palette', title: '个性化', text: '主题和界面定制' }),
+        Object.freeze({ icon: 'fa-solid fa-puzzle-piece', title: '扩展', text: '强大的扩展生态' }),
+    ]),
+});
+
+/* Merged per key over the defaults (a missing or invalid key keeps its default). The server already
+   normalizes these values; they are re-checked here as defense in depth and only ever used as
+   text / DOM properties, never as HTML. */
+const SITE = (function(defaults, injected) {
+    const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+    const raw = isObject(injected) ? injected : {};
+    const rawBg = isObject(raw.background) ? raw.background : {};
+    const defBg = defaults.background;
+
+    function text(value, fallback, max, allowEmpty) {
+        if (typeof value !== 'string') return fallback;
+        const v = Array.from(value.replace(/\p{Cc}/gu, '').trim()).slice(0, max).join('');
+        return (v || allowEmpty) ? v : fallback;
     }
-    el.addEventListener('error', function(){
-        var ov = document.getElementById('stc-bg-overlay');
-        if (ov) ov.style.background =
-            'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)';
-    });
-    document.currentScript.insertAdjacentElement('beforebegin', el);
-})();
+    // http(s) or relative (resolved against <base href="/">) only
+    function url(value, fallback, allowEmpty) {
+        if (typeof value !== 'string') return fallback;
+        const v = value.trim();
+        if (!v) return allowEmpty ? '' : fallback;
+        if (v.length > 1024) return fallback;
+        try {
+            const parsed = new URL(v, document.baseURI);
+            return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? v : fallback;
+        } catch {
+            return fallback;
+        }
+    }
+    // CSS color / gradient only
+    function cssBackground(value, fallback) {
+        if (typeof value !== 'string') return fallback;
+        const v = value.trim();
+        if (!v || v.length > 300 || /[<>;{}\\]/.test(v) || /url\(|expression\(/i.test(v)) return fallback;
+        return v;
+    }
+    function opacity(value, fallback) {
+        const n = typeof value === 'number' ? value
+            : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+        return (Number.isFinite(n) && n >= 0 && n <= 1) ? n : fallback;
+    }
+    function features(value, fallback) {
+        if (!Array.isArray(value)) return fallback;
+        const list = [];
+        for (const item of value) {
+            if (list.length >= 8) break;
+            if (!isObject(item)) continue;
+            const title = text(item.title, '', 30, true);
+            if (!title) continue;
+            const icon = typeof item.icon === 'string' ? item.icon.trim() : '';
+            list.push({
+                icon: (/^[a-z0-9 -]{1,60}$/.test(icon) && icon.includes('fa-')) ? icon : 'fa-solid fa-star',
+                title,
+                text: text(item.text, '', 80, true),
+            });
+        }
+        return list;
+    }
+
+    return {
+        name: text(raw.name, defaults.name, 60, false),
+        badge: text(raw.badge, defaults.badge, 60, true),
+        subtitle: text(raw.subtitle, defaults.subtitle, 120, true),
+        subtitle2: text(raw.subtitle2, defaults.subtitle2, 120, true),
+        logoUrl: url(raw.logoUrl, defaults.logoUrl, false),
+        background: {
+            pcVideoUrl: url(rawBg.pcVideoUrl, defBg.pcVideoUrl, true),
+            pcImageUrl: url(rawBg.pcImageUrl, defBg.pcImageUrl, true),
+            mobileImageUrl: url(rawBg.mobileImageUrl, defBg.mobileImageUrl, true),
+            fallback: cssBackground(rawBg.fallback, defBg.fallback),
+            overlayOpacity: opacity(rawBg.overlayOpacity, defBg.overlayOpacity),
+            sakura: typeof rawBg.sakura === 'boolean' ? rawBg.sakura : defBg.sakura,
+        },
+        features: features(raw.features, defaults.features),
+    };
+})(STC_SITE_DEFAULTS, window.STC_SITE);
 </script>
 <div id="stc-bg-overlay"></div>
+<!-- Adaptive background (config.yaml → site.background): image on mobile, video (or image) on PC -->
+<script>
+(function() {
+    const bg = SITE.background;
+    const overlay = document.getElementById('stc-bg-overlay');
+    const mobile = window.matchMedia('(max-width:1023px)').matches ||
+        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+
+    // Overlay keeps its rgb(6, 3, 20) tint; only the alpha is configurable
+    if (overlay) overlay.style.background = 'rgba(6, 3, 20, ' + (Math.round(bg.overlayOpacity * 1000) / 1000) + ')';
+
+    let fallbackShown = false;
+    function showFallback() {
+        if (!overlay || fallbackShown) return;
+        fallbackShown = true;
+        overlay.style.background = '';
+        overlay.style.background = bg.fallback;
+        // A value the browser rejects leaves the style empty: use the built-in gradient instead
+        if (!overlay.style.background) overlay.style.background = STC_SITE_DEFAULTS.background.fallback;
+    }
+
+    let src = '';
+    let isVideo = false;
+    if (mobile) {
+        src = bg.mobileImageUrl || bg.pcImageUrl;
+    } else if (bg.pcVideoUrl) {
+        src = bg.pcVideoUrl;
+        isVideo = true;
+    } else {
+        src = bg.pcImageUrl;
+    }
+    if (!src) {
+        showFallback();
+        return;
+    }
+
+    let el;
+    function onVideoError() {
+        // Video failed: show the PC image instead when configured, otherwise the fallback
+        if (!bg.pcImageUrl || !el || el.tagName !== 'VIDEO') return showFallback();
+        const img = document.createElement('img');
+        img.id = 'stc-bg-video';
+        img.alt = '';
+        img.addEventListener('error', showFallback);
+        img.src = bg.pcImageUrl;
+        el.replaceWith(img);
+        el = img;
+    }
+    if (isVideo) {
+        el = document.createElement('video');
+        el.autoplay = true; el.muted = true; el.loop = true;
+        el.setAttribute('playsinline', '');
+        // pcImageUrl is shown while the video loads and replaces it if the video fails
+        if (bg.pcImageUrl) el.poster = bg.pcImageUrl;
+        const s = document.createElement('source');
+        s.src = src; s.type = 'video/mp4';
+        // A failing <source> fires "error" on the <source> itself, not on the <video>
+        s.addEventListener('error', onVideoError);
+        el.appendChild(s);
+    } else {
+        el = document.createElement('img');
+        el.src = src;
+        el.alt = '';
+    }
+    el.id = 'stc-bg-video';
+    el.addEventListener('error', isVideo ? onVideoError : showFallback);
+    if (overlay) overlay.insertAdjacentElement('beforebegin', el);
+    else document.currentScript.insertAdjacentElement('beforebegin', el);
+})();
+</script>
 
 <canvas id="stc-sakura"></canvas>
 
@@ -296,8 +454,8 @@
     <div class="card-header">
         <div class="anime-badge">Registration</div>
         <div class="logo-wrap"><i class="fa-solid fa-user-plus"></i></div>
-        <h1>注册账号</h1>
-        <p>创建您的 SillyTavern 账号</p>
+        <h1 id="pageTitle">注册账号</h1>
+        <p id="pageSubtitle">创建您的 SillyTavern 账号</p>
     </div>
 
     <!-- Loading while fetching site config -->
@@ -305,11 +463,27 @@
         <i class="fa-solid fa-spinner fa-spin"></i> 正在加载注册配置...
     </div>
 
-    <!-- Config load error -->
-    <div id="configError">
+    <!-- Config load error (registration stays unavailable until the config loads) -->
+    <div id="configError" style="display:none">
         <i class="fa-solid fa-triangle-exclamation"></i>
-        无法加载注册配置，部分功能可能不可用。
+        无法加载注册配置，暂时无法注册。
         <a href="#" onclick="initConfig();return false;">点击重试</a>
+    </div>
+
+    <!-- Registration closed by admin -->
+    <div id="closedNotice" class="page-notice" style="display:none">
+        <i class="fa-solid fa-lock"></i>
+        <div class="notice-title">管理员已关闭注册</div>
+        <div class="notice-text">暂不接受新用户注册，已有账号可正常登录</div>
+        <a href="/login" class="btn btn-secondary"><i class="fa-solid fa-right-to-bracket"></i> 返回登录</a>
+    </div>
+
+    <!-- OAuth sign-up no longer pending (expired / already used) -->
+    <div id="oauthExpiredNotice" class="page-notice error" style="display:none">
+        <i class="fa-solid fa-clock-rotate-left"></i>
+        <div class="notice-title">登录状态已失效，请返回登录页重新使用第三方账号登录</div>
+        <div class="notice-text">为保护账号安全，第三方授权信息仅在短时间内有效</div>
+        <a href="/login" class="btn btn-secondary"><i class="fa-solid fa-right-to-bracket"></i> 返回登录页</a>
     </div>
 
     <!-- Registration form (shown after config loads) -->
@@ -324,16 +498,17 @@
             </div>
             <input type="text" id="regName" placeholder="用户名（2–32个字符，支持英文/数字/连字符）"
                    autocomplete="username" minlength="2" maxlength="32" required>
-            <div class="field-hint">用于登录，仅支持英文、数字、连字符</div>
+            <div class="field-hint" id="regNameHint">用于登录，仅支持英文、数字、连字符</div>
         </div>
 
-        <div class="field">
+        <div class="field" id="passwordField">
             <div class="field-label">
-                <i class="fa-solid fa-lock"></i> 密码 <span style="font-size:.8em;color:rgba(255,255,255,.3);margin-left:4px">（可选）</span>
+                <i class="fa-solid fa-lock"></i> 密码 <span class="req">*</span>
             </div>
-            <input type="password" id="regPassword" placeholder="设置登录密码（可留空）"
+            <input type="password" id="regPassword" placeholder="设置登录密码（8–128 个字符）"
                    autocomplete="new-password">
             <div id="pwdStrengthBar"><div id="pwdStrengthFill"></div></div>
+            <div class="field-hint">密码长度需为 8-128 个字符</div>
         </div>
 
         <!-- ── Invitation Code (shown when enabled) ── -->
@@ -350,7 +525,7 @@
                 <div class="field-hint">注册需要有效的激活码，可向管理员获取</div>
             </div>
             <div id="purchaseLinkRow" style="display:none">
-                <a id="purchaseLinkBtn" href="#" target="_blank" rel="noopener" class="purchase-link-btn">
+                <a id="purchaseLinkBtn" href="#" target="_blank" rel="noopener noreferrer" class="purchase-link-btn">
                     <i class="fa-solid fa-cart-shopping"></i> 购买激活码
                 </a>
             </div>
@@ -403,46 +578,183 @@
 <script>
 let stcConfig = {};
 let sendCooldown = false;
+// Pending OAuth sign-up ({ provider, username, displayName }) being completed with an invite code
+let oauthPending = null;
+// Whether the OAuth completion must include an invite code (unknown config → assume required)
+let oauthInviteRequired = true;
+let csrfTokenPromise = null;
+
+const OAUTH_PROVIDER_LABELS = {
+    github: 'GitHub',
+    discord: 'Discord',
+    linuxdo: 'Linux.do',
+    qrole: 'QRole',
+};
+
+function setDisplay(id, value) {
+    document.getElementById(id).style.display = value;
+}
+
+// Only allow http(s) links (blocks javascript:/data: URLs from config)
+function safeHttpUrl(value) {
+    if (typeof value !== 'string' || !value.trim()) return '';
+    try {
+        const url = new URL(value.trim(), location.origin);
+        return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : '';
+    } catch {
+        return '';
+    }
+}
+
+/* CSRF token for POST requests (cached; fetched again next time if it fails) */
+function getCsrfToken() {
+    if (!csrfTokenPromise) {
+        csrfTokenPromise = fetch('/csrf-token')
+            .then(resp => {
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                return resp.json();
+            })
+            .then(data => String(data?.token ?? ''))
+            .catch(e => {
+                csrfTokenPromise = null;
+                throw e;
+            });
+    }
+    return csrfTokenPromise;
+}
+
+async function postJson(url, body) {
+    const token = await getCsrfToken();
+    return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+        body: JSON.stringify(body),
+    });
+}
+
+async function readJson(resp) {
+    try {
+        const data = await resp.json();
+        return data && typeof data === 'object' ? data : {};
+    } catch {
+        return {};
+    }
+}
+
+function responseError(resp, data, fallback) {
+    if (typeof data.error === 'string' && data.error) return data.error;
+    if (resp.status === 403) return '请求已失效，请刷新页面后重试';
+    return fallback;
+}
+
+function showClosedNotice() {
+    setDisplay('registerForm', 'none');
+    setDisplay('closedNotice', '');
+}
+
+function showPurchaseLink() {
+    const purchaseLink = safeHttpUrl(stcConfig.purchaseLink);
+    if (!purchaseLink) return;
+    document.getElementById('purchaseLinkBtn').href = purchaseLink;
+    setDisplay('purchaseLinkRow', '');
+}
+
+function resetRegisterBtn() {
+    const btn = document.getElementById('registerBtn');
+    btn.disabled = false;
+    btn.innerHTML = oauthPending
+        ? '<i class="fa-solid fa-user-check"></i> 完成注册'
+        : '<i class="fa-solid fa-user-plus"></i> 创建账号';
+}
 
 async function initConfig() {
-    document.getElementById('loadingOverlay').style.display = 'flex';
-    document.getElementById('registerForm').style.display = 'none';
-    document.getElementById('configError').style.display = 'none';
+    oauthPending = null;
+    oauthInviteRequired = true;
+    setDisplay('loadingOverlay', 'flex');
+    for (const id of ['registerForm', 'configError', 'closedNotice', 'oauthExpiredNotice']) {
+        setDisplay(id, 'none');
+    }
+
+    let configLoaded = false;
     try {
         const resp = await fetch('/api/stc/public-config/public-pages');
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        stcConfig = await resp.json();
+        stcConfig = (await resp.json()) || {};
+        configLoaded = true;
     } catch (e) {
         console.warn('[STC] Config fetch failed:', e.message);
         stcConfig = {};
-        document.getElementById('configError').style.display = '';
     }
-    document.getElementById('loadingOverlay').style.display = 'none';
-    document.getElementById('registerForm').style.display = 'flex';
+
+    if (new URLSearchParams(location.search).get('oauth') === 'pending') {
+        await initOAuthCompletion(configLoaded);
+        return;
+    }
+
+    setDisplay('loadingOverlay', 'none');
+    // Fail closed: the form is only shown when the server confirms registration is open
+    if (!configLoaded) {
+        setDisplay('configError', 'block');
+        return;
+    }
+    if (stcConfig.enableRegistration !== true) {
+        showClosedNotice();
+        return;
+    }
 
     if (stcConfig.enableInvitationCodes) {
-        document.getElementById('inviteCodeSection').style.display = '';
-        if (stcConfig.purchaseLink) {
-            document.getElementById('purchaseLinkBtn').href = stcConfig.purchaseLink;
-            document.getElementById('purchaseLinkRow').style.display = '';
-        }
+        setDisplay('inviteCodeSection', '');
+        showPurchaseLink();
     }
     if (stcConfig.enableEmailVerification) {
-        document.getElementById('emailSection').style.display = '';
+        setDisplay('emailSection', '');
+    }
+    setDisplay('registerForm', 'flex');
+}
+
+/* OAuth sign-up that needs an invite code. The identity stays in the server session. */
+async function initOAuthCompletion(configLoaded) {
+    let resp;
+    try {
+        resp = await fetch('/api/stc/oauth/pending', { cache: 'no-store' });
+    } catch (e) {
+        console.warn('[STC] OAuth pending fetch failed:', e.message);
+        setDisplay('loadingOverlay', 'none');
+        setDisplay('configError', 'block');
+        return;
+    }
+    setDisplay('loadingOverlay', 'none');
+
+    if (!resp.ok) {
+        setDisplay('oauthExpiredNotice', '');
+        return;
+    }
+    if (configLoaded && stcConfig.enableRegistration === false) {
+        showClosedNotice();
+        return;
     }
 
-    const params = new URLSearchParams(location.search);
-    const oauthData = params.get('oauth');
-    if (oauthData) {
-        try {
-            const data = JSON.parse(atob(oauthData));
-            const nameInput = document.getElementById('regName');
-            nameInput.value = data.username || '';
-            nameInput.readOnly = true;
-            document.getElementById('regPassword').closest('.field').style.display = 'none';
-            window._oauthData = data;
-        } catch {}
-    }
+    const pending = await readJson(resp);
+    oauthPending = pending;
+
+    const providerLabel = Object.prototype.hasOwnProperty.call(OAUTH_PROVIDER_LABELS, pending.provider)
+        ? OAUTH_PROVIDER_LABELS[pending.provider]
+        : '第三方';
+    document.getElementById('pageTitle').textContent = '完成注册';
+    document.getElementById('pageSubtitle').textContent = `使用 ${providerLabel} 账号完成注册`;
+
+    const nameInput = document.getElementById('regName');
+    nameInput.value = String(pending.displayName || pending.username || '');
+    nameInput.readOnly = true;
+    document.getElementById('regNameHint').textContent = '来自第三方账号，登录用户名将自动生成';
+
+    setDisplay('passwordField', 'none');
+    setDisplay('emailSection', 'none');
+    oauthInviteRequired = !configLoaded || stcConfig.enableInvitationCodes !== false;
+    setDisplay('inviteCodeSection', oauthInviteRequired ? '' : 'none');
+    if (oauthInviteRequired) showPurchaseLink();
+    resetRegisterBtn();
+    setDisplay('registerForm', 'flex');
 }
 
 /* Password strength */
@@ -451,8 +763,8 @@ document.getElementById('regPassword').addEventListener('input', function() {
     const fill = document.getElementById('pwdStrengthFill');
     if (!pw) { fill.style.width = '0'; return; }
     let score = 0;
-    if (pw.length >= 6)  score++;
-    if (pw.length >= 10) score++;
+    if (pw.length >= 8)  score++;
+    if (pw.length >= 12) score++;
     if (/[A-Z]/.test(pw)) score++;
     if (/[0-9]/.test(pw)) score++;
     if (/[^A-Za-z0-9]/.test(pw)) score++;
@@ -478,47 +790,87 @@ async function sendVerification() {
     const btn = document.getElementById('sendCodeBtn');
     btn.disabled = true;
     btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+    const resetSendBtn = () => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送';
+        sendCooldown = false;
+    };
     try {
-        const resp = await fetch('/api/stc/users/send-verification', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, userName: name }),
-        });
-        const data = await resp.json();
-        if (data.success) {
+        const resp = await postJson('/api/stc/users/send-verification', { email, userName: name });
+        const data = await readJson(resp);
+        if (resp.ok && data.success) {
             showSuccess('验证码已发送至 ' + email);
             let sec = 60;
             const timer = setInterval(() => {
                 btn.innerHTML = `<i class="fa-solid fa-clock"></i> ${sec}s`;
                 if (--sec < 0) {
                     clearInterval(timer);
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送';
-                    sendCooldown = false;
+                    resetSendBtn();
                 }
             }, 1000);
+        } else if (data.code === 'REGISTRATION_CLOSED') {
+            resetSendBtn();
+            showClosedNotice();
         } else {
-            showError(data.error || '发送失败，请稍后重试');
-            btn.disabled = false;
-            btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送';
-            sendCooldown = false;
+            showError(responseError(resp, data, '发送失败，请稍后重试'));
+            resetSendBtn();
         }
     } catch {
         showError('网络错误，请重试');
-        btn.disabled = false;
-        btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送';
-        sendCooldown = false;
+        resetSendBtn();
+    }
+}
+
+/* OAuth completion: only the invite code is sent; the server uses the session identity */
+async function completeOAuthRegistration(inviteCode) {
+    if (oauthInviteRequired && !inviteCode) {
+        showError('请输入激活码（注册必须填写）');
+        document.getElementById('regInviteCode').focus();
+        return;
+    }
+
+    const btn = document.getElementById('registerBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 注册中...';
+
+    try {
+        const resp = await postJson('/api/stc/oauth/complete-registration', { inviteCode });
+        const data = await readJson(resp);
+        if (resp.ok && data.success) {
+            showSuccess('注册成功！正在跳转...');
+            setTimeout(() => { window.location.href = '/'; }, 1200);
+        } else if (data.code === 'REGISTRATION_CLOSED') {
+            showClosedNotice();
+        } else {
+            showError(responseError(resp, data, '注册失败'));
+            resetRegisterBtn();
+        }
+    } catch {
+        showError('网络错误，请稍后重试');
+        resetRegisterBtn();
     }
 }
 
 document.getElementById('registerForm').addEventListener('submit', async () => {
     clearMessages();
+    const inviteCode = document.getElementById('regInviteCode').value.trim();
+
+    if (oauthPending) {
+        await completeOAuthRegistration(inviteCode);
+        return;
+    }
+
     const name             = document.getElementById('regName').value.trim();
     const password         = document.getElementById('regPassword').value;
-    const inviteCode       = document.getElementById('regInviteCode').value.trim();
     const email            = document.getElementById('regEmail').value.trim();
     const verificationCode = document.getElementById('regVerCode').value.trim();
 
     if (!name || name.length < 2) { showError('用户名至少需要2个字符'); return; }
+    if (password.length < 8 || password.length > 128) {
+        showError('密码长度需为 8-128 个字符');
+        document.getElementById('regPassword').focus();
+        return;
+    }
     if (stcConfig.enableInvitationCodes && !inviteCode) {
         showError('请输入激活码（注册必须填写）');
         document.getElementById('regInviteCode').focus();
@@ -533,67 +885,42 @@ document.getElementById('registerForm').addEventListener('submit', async () => {
     btn.disabled = true;
     btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 注册中...';
 
-    if (window._oauthData) {
-        try {
-            const resp = await fetch('/api/stc/oauth/complete-registration', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...window._oauthData, inviteCode }),
-            });
-            const data = await resp.json();
-            if (data.success) {
-                showSuccess('注册成功！正在跳转...');
-                setTimeout(() => { window.location.href = '/'; }, 1200);
-            } else {
-                showError(data.error || '注册失败');
-                btn.disabled = false;
-                btn.innerHTML = '<i class="fa-solid fa-user-plus"></i> 创建账号';
-            }
-        } catch {
-            showError('网络错误，请稍后重试');
-            btn.disabled = false;
-            btn.innerHTML = '<i class="fa-solid fa-user-plus"></i> 创建账号';
-        }
-        return;
-    }
-
     try {
-        const resp = await fetch('/api/stc/users/register', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                name, password,
-                inviteCode:       inviteCode       || undefined,
-                email:            email            || undefined,
-                verificationCode: verificationCode || undefined,
-            }),
+        const resp = await postJson('/api/stc/users/register', {
+            name, password,
+            inviteCode:       inviteCode       || undefined,
+            email:            email            || undefined,
+            verificationCode: verificationCode || undefined,
         });
-        const data = await resp.json();
-        if (data.success) {
+        const data = await readJson(resp);
+        if (resp.ok && data.success) {
             const expMsg = data.expiresAt
                 ? `账户有效期至 ${new Date(data.expiresAt).toLocaleDateString('zh-CN')}，`
                 : '';
             showSuccess(`注册成功！${expMsg}正在跳转到登录页...`);
             setTimeout(() => { window.location.href = '/login'; }, 2000);
+        } else if (data.code === 'REGISTRATION_CLOSED') {
+            showClosedNotice();
         } else {
-            showError(data.error || '注册失败，请检查填写内容');
-            btn.disabled = false;
-            btn.innerHTML = '<i class="fa-solid fa-user-plus"></i> 创建账号';
+            showError(responseError(resp, data, '注册失败，请检查填写内容'));
+            resetRegisterBtn();
         }
     } catch {
         showError('网络错误，请稍后重试');
-        btn.disabled = false;
-        btn.innerHTML = '<i class="fa-solid fa-user-plus"></i> 创建账号';
+        resetRegisterBtn();
     }
 });
 
+// .msg defaults to display:none, so show messages with an explicit display value
 function showError(msg) {
     const el = document.getElementById('errorMsg');
-    el.textContent = msg; el.className = 'msg error'; el.style.display = '';
+    el.textContent = msg; el.className = 'msg error'; el.style.display = 'block';
     document.getElementById('successMsg').style.display = 'none';
     el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 function showSuccess(msg) {
     const el = document.getElementById('successMsg');
-    el.textContent = msg; el.className = 'msg success'; el.style.display = '';
+    el.textContent = msg; el.className = 'msg success'; el.style.display = 'block';
     document.getElementById('errorMsg').style.display = 'none';
 }
 function clearMessages() {
@@ -601,11 +928,18 @@ function clearMessages() {
     document.getElementById('successMsg').style.display = 'none';
 }
 
+// Brand text from config.yaml → site.name (text only; the OAuth completion flow replaces it later)
+document.getElementById('pageSubtitle').textContent = `创建您的 ${SITE.name} 账号`;
+
 initConfig();
 
 /* ── Sakura particles ── */
 (function() {
     const c = document.getElementById('stc-sakura');
+    if (!SITE.background.sakura) {
+        c.style.display = 'none';
+        return;
+    }
     const ctx = c.getContext('2d');
     const colors = ['#ffb7c5','#ffc8d4','#e8c4f8','#c4d8ff','#ffd8f0','#e0b8ff'];
     const petals = [];

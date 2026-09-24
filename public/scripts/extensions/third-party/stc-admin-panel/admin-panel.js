@@ -426,6 +426,19 @@ function renderUserList() {
 // ═══════════════════════════════════════════════════
 async function renderInvitationTab(container) {
     container.innerHTML = `
+      <!-- Registration settings -->
+      <div id="stc-reg-card" style="background:rgba(255,255,255,.04);border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 12px">注册设置</h4>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.95em">
+            <input id="stc-reg-enabled" type="checkbox" disabled> 开放注册</label>
+          <span id="stc-reg-status" style="font-size:.8em;color:#888">加载中...</span>
+          <button id="stc-reg-save" class="menu_button" disabled style="margin-left:auto;padding:7px 18px;background:#27ae60;font-size:.85em;white-space:nowrap;color:#fff"><i class="fa-solid fa-save"></i> 保存</button>
+        </div>
+        <div style="font-size:.8em;color:#888;margin-top:10px;line-height:1.6">关闭后：隐藏注册按钮、拒绝注册；已有账号可正常登录；QRole 会员首次登录仍会自动开户</div>
+        <div id="stc-reg-invite-state" style="font-size:.8em;color:#888;margin-top:4px"></div>
+      </div>
+
       <!-- Purchase link -->
       <div style="background:rgba(255,193,7,.08);border:1px solid rgba(255,193,7,.3);border-radius:8px;padding:14px;margin-bottom:16px">
         <div style="font-size:.85em;margin-bottom:6px;color:#ffc107"><i class="fa-solid fa-circle-info"></i> 邀请码功能需在 config.yaml 中设置 <code>enableInvitationCodes: true</code></div>
@@ -497,6 +510,57 @@ async function renderInvitationTab(container) {
           <i class="fa-solid fa-download"></i> 下载全部</button>
       </div>
       <div id="stc-inv-list">加载中...</div>`;
+
+    // Registration switch (controls stay disabled until the current value is known,
+    // so a failed load can never silently close registration)
+    const regEnabled = document.getElementById('stc-reg-enabled');
+    const regSave = document.getElementById('stc-reg-save');
+    const regStatus = document.getElementById('stc-reg-status');
+    const showRegState = (enabled) => {
+        if (!regStatus) return;
+        regStatus.textContent = enabled ? '当前：已开放注册' : '当前：已关闭注册';
+        regStatus.style.color = enabled ? '#27ae60' : '#e74c3c';
+    };
+    fetch('/api/stc/registration-config/config', { headers: getHeaders() })
+        .then(async r => {
+            if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error || `HTTP ${r.status}`);
+            return r.json();
+        })
+        .then(d => {
+            if (regEnabled) {
+                regEnabled.checked = d.enableRegistration !== false;
+                regEnabled.disabled = false;
+            }
+            if (regSave) regSave.disabled = false;
+            showRegState(d.enableRegistration !== false);
+            const inviteState = document.getElementById('stc-reg-invite-state');
+            if (inviteState) {
+                inviteState.textContent = d.enableInvitationCodes
+                    ? '邀请码：已启用（新用户注册需要邀请码）'
+                    : '邀请码：未启用';
+            }
+        })
+        .catch(e => {
+            if (regStatus) {
+                regStatus.textContent = '加载失败: ' + e.message;
+                regStatus.style.color = '#e74c3c';
+            }
+        });
+
+    regSave?.addEventListener('click', async () => {
+        const enableRegistration = !!regEnabled?.checked;
+        setBtn('stc-reg-save', true);
+        try {
+            const r = await fetch('/api/stc/registration-config/config', { method: 'POST', headers: getHeaders(), body: JSON.stringify({ enableRegistration }) });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+            const saved = d.enableRegistration !== undefined ? !!d.enableRegistration : enableRegistration;
+            if (regEnabled) regEnabled.checked = saved;
+            showRegState(saved);
+            toast(saved ? '已开放注册，立即生效' : '已关闭注册，立即生效');
+        } catch (e) { toast('保存失败: ' + e.message, true); }
+        setBtn('stc-reg-save', false, '<i class="fa-solid fa-save"></i> 保存');
+    });
 
     // Load purchase link
     fetch('/api/stc/invitation-codes/purchase-link', { headers: getHeaders() })
@@ -880,33 +944,71 @@ async function renderEmailTab(container) {
 // ═══════════════════════════════════════════════════
 // TAB: OAuth 配置
 // ═══════════════════════════════════════════════════
+// Endpoint defaults (mirror src/stc-mod/config.js); blank fields fall back to these on the server
+const OAUTH_ENDPOINT_DEFAULTS = {
+    linuxdo: {
+        authUrl: 'https://connect.linux.do/oauth2/authorize',
+        tokenUrl: 'https://connect.linux.do/oauth2/token',
+        userInfoUrl: 'https://connect.linux.do/api/user',
+    },
+    qrole: {
+        authUrl: 'https://www.qqy.one/api/oauth/authorize',
+        tokenUrl: 'https://www.qqy.one/api/oauth/token',
+        userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo',
+    },
+};
+
+const QROLE_DEFAULTS = {
+    scope: 'openid profile email',
+    tokenAuthMethod: 'client_secret_post',
+    allowedTiers: ['vip', 'svip'],
+    tierClaims: ['membershipTierId', 'membership_tier', 'membership.tierId', 'membership.tier', 'tier'],
+    expiryClaims: ['membershipExpiresAt', 'membership_expires_at', 'membership.expiresAt'],
+    reverifyHours: 24,
+};
+const QROLE_REVERIFY_MAX_HOURS = 8760;
+
+/** Config list (array or comma-separated string) → text for an input. */
+function listToText(value, fallback = []) {
+    if (Array.isArray(value)) return value.join(',');
+    if (typeof value === 'string') return value;
+    return fallback.join(',');
+}
+
+/** Comma-separated input text → array of trimmed non-empty strings. */
+function textToList(text) {
+    return String(text ?? '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
 async function renderOAuthTab(container) {
     let oauthConfig = {};
+    let loadFailed = false;
     try {
         const r = await fetch('/api/stc/oauth-config/config', { headers: getHeaders() });
         if (r.ok) oauthConfig = await r.json();
-    } catch {}
+        else loadFailed = true;
+    } catch { loadFailed = true; }
 
     // Get current domain for callback URL example
     const currentDomain = window.location.origin;
 
     const renderProvider = (id, label, icon, color, extra = '') => {
-        const callbackExample = `${currentDomain}/api/stc/oauth/${id}/callback`;
+        const callbackExample = esc(`${currentDomain}/api/stc/oauth/${id}/callback`);
         return `
       <div style="background:rgba(255,255,255,.04);border-radius:10px;padding:16px;margin-bottom:16px">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
           <i class="${icon}" style="color:${color};font-size:1.3em"></i>
           <strong>${label}</strong>
           <label style="display:flex;align-items:center;gap:6px;margin-left:auto;cursor:pointer;font-size:.85em">
-            <input class="stc-oauth-enabled" type="checkbox" data-provider="${id}" ${oauthConfig[id]?.enabled ? 'checked' : ''}> 启用
+            <input class="stc-oauth-enabled" type="checkbox" data-provider="${id}"> 启用
           </label>
         </div>
         <div class="stc-form-row"><label>Client ID:</label>
-          <input class="stc-oauth-clientid" data-provider="${id}" type="text" value="${esc(oauthConfig[id]?.clientId || '')}"></div>
+          <input class="stc-oauth-clientid" data-provider="${id}" type="text"></div>
         <div class="stc-form-row"><label>Client Secret:</label>
-          <input class="stc-oauth-secret" data-provider="${id}" type="password" value="${esc(oauthConfig[id]?.clientSecret || '')}"></div>
+          <input class="stc-oauth-secret" data-provider="${id}" type="password" autocomplete="new-password"></div>
         <div class="stc-form-row"><label>Callback URL:</label>
-          <input class="stc-oauth-callback" data-provider="${id}" type="text" value="${esc(oauthConfig[id]?.callbackUrl || '')}" placeholder="留空则自动生成"></div>
+          <input class="stc-oauth-callback" data-provider="${id}" type="text" placeholder="留空则自动生成"></div>
         ${extra}
         <div style="background:rgba(255,255,255,.02);border-left:3px solid #4a90e2;padding:10px 12px;margin:10px 0;border-radius:4px;font-size:.78em;color:#aaa">
           <div style="color:#4a90e2;font-weight:600;margin-bottom:4px"><i class="fa-solid fa-circle-info"></i> 回调地址配置说明</div>
@@ -926,51 +1028,181 @@ async function renderOAuthTab(container) {
       </div>`;
     };
 
+    const endpointRows = (id) => `
+        <div class="stc-form-row"><label>Auth URL:</label>
+          <input class="stc-oauth-authurl" data-provider="${id}" type="text" placeholder="${OAUTH_ENDPOINT_DEFAULTS[id].authUrl}"></div>
+        <div class="stc-form-row"><label>Token URL:</label>
+          <input class="stc-oauth-tokenurl" data-provider="${id}" type="text" placeholder="${OAUTH_ENDPOINT_DEFAULTS[id].tokenUrl}"></div>
+        <div class="stc-form-row"><label>UserInfo URL:</label>
+          <input class="stc-oauth-userinfourl" data-provider="${id}" type="text" placeholder="${OAUTH_ENDPOINT_DEFAULTS[id].userInfoUrl}"></div>`;
+
+    const qroleExtra = `
+        <div class="stc-form-row"><label>Scope:</label>
+          <input class="stc-oauth-scope" data-provider="qrole" type="text" placeholder="${QROLE_DEFAULTS.scope}"></div>
+        ${endpointRows('qrole')}
+        <div class="stc-form-row"><label>Token 认证方式:</label>
+          <select class="stc-oauth-tokenauth" data-provider="qrole">
+            <option value="client_secret_post">client_secret_post（表单参数）</option>
+            <option value="client_secret_basic">client_secret_basic（HTTP Basic）</option>
+          </select></div>
+        <label class="stc-oauth-check">
+          <input class="stc-oauth-pkce" data-provider="qrole" type="checkbox"> 启用 PKCE（S256）</label>
+        <label class="stc-oauth-check">
+          <input class="stc-oauth-requiremember" data-provider="qrole" type="checkbox"> 仅允许会员登录（关闭后任何 QRole 用户均可登录）</label>
+        <div class="stc-form-row"><label>允许的会员等级:</label>
+          <input class="stc-oauth-tiers" data-provider="qrole" type="text" placeholder="${QROLE_DEFAULTS.allowedTiers.join(',')}"></div>
+        <div class="stc-oauth-hint">逗号分隔，不区分大小写（例如 vip,svip）；未列出的等级（包括 free）将被拒绝登录。</div>
+        <div class="stc-form-row"><label>会员状态复核间隔（小时）:</label>
+          <input class="stc-oauth-reverify" data-provider="qrole" type="number" min="0" max="${QROLE_REVERIFY_MAX_HOURS}" step="1" placeholder="${QROLE_DEFAULTS.reverifyHours}"></div>
+        <div class="stc-oauth-hint">超过该时长需重新使用 QRole 登录以确认会员状态；0 = 仅按已知到期时间和等级判断</div>
+        <details class="stc-oauth-advanced">
+          <summary>高级：会员字段映射</summary>
+          <div class="stc-form-row"><label>等级字段:</label>
+            <input class="stc-oauth-tierclaims" data-provider="qrole" type="text" placeholder="${QROLE_DEFAULTS.tierClaims.join(',')}"></div>
+          <div class="stc-form-row"><label>到期字段:</label>
+            <input class="stc-oauth-expiryclaims" data-provider="qrole" type="text" placeholder="${QROLE_DEFAULTS.expiryClaims.join(',')}"></div>
+          <div class="stc-oauth-hint">userinfo 中的字段名，逗号分隔，按顺序取第一个存在的值，支持 a.b 路径；留空则使用默认字段。</div>
+        </details>
+        <div class="stc-oauth-hint" style="color:#e91e63">
+          <i class="fa-solid fa-circle-info"></i> QRole 会员首次登录会自动创建账号（无需邀请码，关闭注册时同样生效）；QRole 的角色不会授予管理员权限。
+        </div>`;
+
     container.innerHTML = `
       <h3 style="margin:0 0 16px">OAuth 第三方登录配置</h3>
+      <div style="font-size:.8em;color:#888;margin:-8px 0 14px">Client Secret 仅可写入：留空表示保持原值不变。</div>
       ${renderProvider('github', 'GitHub OAuth', 'fa-brands fa-github', '#6e5494')}
       ${renderProvider('discord', 'Discord OAuth', 'fa-brands fa-discord', '#5865F2')}
-      ${renderProvider('linuxdo', 'Linux.do OAuth', 'fa-solid fa-globe', '#f59e0b',
-          `<div class="stc-form-row"><label>Auth URL:</label>
-           <input class="stc-oauth-authurl" data-provider="linuxdo" type="text" value="${esc(oauthConfig.linuxdo?.authUrl || 'https://connect.linux.do/oauth2/authorize')}" placeholder="https://connect.linux.do/oauth2/authorize"></div>
-           <div class="stc-form-row"><label>Token URL:</label>
-           <input class="stc-oauth-tokenurl" data-provider="linuxdo" type="text" value="${esc(oauthConfig.linuxdo?.tokenUrl || 'https://connect.linux.do/oauth2/token')}" placeholder="https://connect.linux.do/oauth2/token"></div>`
-      )}
+      ${renderProvider('linuxdo', 'Linux.do OAuth', 'fa-solid fa-globe', '#f59e0b', endpointRows('linuxdo'))}
+      ${renderProvider('qrole', 'QRole OAuth', 'fa-solid fa-crown', '#e91e63', qroleExtra)}
       <style>
         .stc-form-row { display:flex;align-items:center;gap:10px;margin-bottom:10px }
         .stc-form-row label { width:120px;font-size:.85em;color:#aaa;flex-shrink:0 }
-        .stc-form-row input { flex:1;padding:8px 12px;border-radius:6px;border:1px solid #333;background:#0f3460;color:#eee;font-size:.9em }
+        .stc-form-row input, .stc-form-row select { flex:1;padding:8px 12px;border-radius:6px;border:1px solid #333;background:#0f3460;color:#eee;font-size:.9em }
+        .stc-oauth-check { display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;font-size:.85em;color:#ccc }
+        .stc-oauth-hint { font-size:.78em;color:#888;margin:-4px 0 10px;line-height:1.5 }
+        .stc-oauth-advanced { margin-bottom:10px;font-size:.9em }
+        .stc-oauth-advanced summary { cursor:pointer;color:#aaa;font-size:.85em;margin-bottom:10px }
 
         /* Mobile responsive styles */
         @media (max-width: 600px) {
           .stc-form-row { flex-direction:column;align-items:stretch;gap:6px }
           .stc-form-row label { width:100%;font-size:.8em }
-          .stc-form-row input { width:100%;font-size:.85em }
+          .stc-form-row input, .stc-form-row select { width:100%;font-size:.85em }
           .stc-callback-url { font-size:.8em !important;padding:6px !important }
           .stc-copy-callback { width:100%;justify-content:center;font-size:.8em !important }
         }
       </style>`;
 
+    if (loadFailed) {
+        // Saving blank fields over an unknown config would wipe it; block until reloaded
+        container.querySelectorAll('.stc-oauth-save').forEach(btn => { btn.disabled = true; });
+        toast('加载 OAuth 配置失败，请刷新后重试', true);
+    }
+
+    const field = (cls, provider) => container.querySelector(`.${cls}[data-provider="${provider}"]`);
+    const setValue = (cls, provider, value) => {
+        const el = field(cls, provider);
+        if (el) el.value = value ?? '';
+    };
+    const setChecked = (cls, provider, value) => {
+        const el = field(cls, provider);
+        if (el) el.checked = !!value;
+    };
+    const setSecretPlaceholder = (provider, hasSecret) => {
+        const el = field('stc-oauth-secret', provider);
+        if (el) el.placeholder = hasSecret ? '已设置，留空保持不变' : '未设置';
+    };
+
+    // Populate inputs from config (never interpolated into markup)
+    for (const provider of ['github', 'discord', 'linuxdo', 'qrole']) {
+        const cfg = oauthConfig[provider] || {};
+        setChecked('stc-oauth-enabled', provider, cfg.enabled);
+        setValue('stc-oauth-clientid', provider, cfg.clientId);
+        setValue('stc-oauth-callback', provider, cfg.callbackUrl);
+        setSecretPlaceholder(provider, !!cfg.hasClientSecret);
+        if (OAUTH_ENDPOINT_DEFAULTS[provider]) {
+            setValue('stc-oauth-authurl', provider, cfg.authUrl);
+            setValue('stc-oauth-tokenurl', provider, cfg.tokenUrl);
+            setValue('stc-oauth-userinfourl', provider, cfg.userInfoUrl);
+        }
+    }
+    const qroleCfg = oauthConfig.qrole || {};
+    setValue('stc-oauth-scope', 'qrole', qroleCfg.scope ?? QROLE_DEFAULTS.scope);
+    setValue('stc-oauth-tokenauth', 'qrole', qroleCfg.tokenAuthMethod === 'client_secret_basic' ? 'client_secret_basic' : QROLE_DEFAULTS.tokenAuthMethod);
+    setChecked('stc-oauth-pkce', 'qrole', qroleCfg.usePkce !== false);
+    setChecked('stc-oauth-requiremember', 'qrole', qroleCfg.requireMembership !== false);
+    setValue('stc-oauth-tiers', 'qrole', listToText(qroleCfg.allowedTiers, QROLE_DEFAULTS.allowedTiers));
+    setValue('stc-oauth-tierclaims', 'qrole', listToText(qroleCfg.tierClaims, QROLE_DEFAULTS.tierClaims));
+    setValue('stc-oauth-expiryclaims', 'qrole', listToText(qroleCfg.expiryClaims, QROLE_DEFAULTS.expiryClaims));
+    setValue('stc-oauth-reverify', 'qrole', Number.isInteger(qroleCfg.reverifyHours) ? qroleCfg.reverifyHours : QROLE_DEFAULTS.reverifyHours);
+
+    // List fields are only sent when edited: an untouched list may be unset in config.yaml
+    // (built-in defaults apply), and saving it would pin today's defaults into the file.
+    const QROLE_LIST_INPUTS = { allowedTiers: 'stc-oauth-tiers', tierClaims: 'stc-oauth-tierclaims', expiryClaims: 'stc-oauth-expiryclaims' };
+    const loadedQroleLists = {};
+    for (const [key, cls] of Object.entries(QROLE_LIST_INPUTS)) {
+        loadedQroleLists[key] = field(cls, 'qrole')?.value?.trim() ?? '';
+    }
+
     container.querySelectorAll('.stc-oauth-save').forEach(btn => {
         btn.addEventListener('click', async () => {
             const provider = btn.dataset.provider;
-            const row = (cls) => container.querySelector(`.${cls}[data-provider="${provider}"]`)?.value?.trim();
+            const row = (cls) => field(cls, provider)?.value?.trim();
             const data = {
                 provider,
-                enabled: !!container.querySelector(`.stc-oauth-enabled[data-provider="${provider}"]`)?.checked,
+                enabled: !!field('stc-oauth-enabled', provider)?.checked,
                 clientId: row('stc-oauth-clientid'),
-                clientSecret: row('stc-oauth-secret'),
                 callbackUrl: row('stc-oauth-callback'),
-                ...(provider === 'linuxdo' ? {
-                    authUrl: row('stc-oauth-authurl'),
-                    tokenUrl: row('stc-oauth-tokenurl'),
-                } : {}),
             };
+            // Blank secret = keep the stored one (the server never returns it)
+            const secret = row('stc-oauth-secret');
+            if (secret) data.clientSecret = secret;
+            if (OAUTH_ENDPOINT_DEFAULTS[provider]) {
+                data.authUrl = row('stc-oauth-authurl');
+                data.tokenUrl = row('stc-oauth-tokenurl');
+                data.userInfoUrl = row('stc-oauth-userinfourl');
+            }
+            if (provider === 'qrole') {
+                data.scope = row('stc-oauth-scope');
+                data.tokenAuthMethod = row('stc-oauth-tokenauth') || QROLE_DEFAULTS.tokenAuthMethod;
+                data.usePkce = !!field('stc-oauth-pkce', provider)?.checked;
+                data.requireMembership = !!field('stc-oauth-requiremember', provider)?.checked;
+                const allowedTiers = textToList(row('stc-oauth-tiers')).map(t => t.toLowerCase());
+                if (data.requireMembership && !allowedTiers.length) {
+                    toast('开启会员限制时，请至少填写一个允许的会员等级', true);
+                    return;
+                }
+                for (const [key, cls] of Object.entries(QROLE_LIST_INPUTS)) {
+                    if ((row(cls) ?? '') === loadedQroleLists[key]) continue;
+                    data[key] = key === 'allowedTiers' ? allowedTiers : textToList(row(cls));
+                }
+                // Blank = default; unparsable input (value '' with badInput) is rejected below
+                const reverifyText = row('stc-oauth-reverify');
+                const reverifyHours = reverifyText
+                    ? Number(reverifyText)
+                    : (field('stc-oauth-reverify', provider)?.validity?.badInput ? NaN : QROLE_DEFAULTS.reverifyHours);
+                if (!Number.isInteger(reverifyHours) || reverifyHours < 0 || reverifyHours > QROLE_REVERIFY_MAX_HOURS) {
+                    toast(`会员状态复核间隔需为 0-${QROLE_REVERIFY_MAX_HOURS} 之间的整数（小时）`, true);
+                    return;
+                }
+                data.reverifyHours = reverifyHours;
+            }
+            btn.disabled = true;
             try {
                 const r = await fetch('/api/stc/oauth-config/config', { method: 'POST', headers: getHeaders(), body: JSON.stringify(data) });
-                if (!r.ok) throw new Error((await r.json())?.error);
-                toast(`${provider} OAuth 配置已保存（需重启生效）`);
+                if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error || `HTTP ${r.status}`);
+                if (data.clientSecret) {
+                    setValue('stc-oauth-secret', provider, '');
+                    setSecretPlaceholder(provider, true);
+                }
+                if (provider === 'qrole') {
+                    for (const [key, cls] of Object.entries(QROLE_LIST_INPUTS)) {
+                        if (data[key]) loadedQroleLists[key] = row(cls) ?? '';
+                    }
+                }
+                toast('已保存，立即生效');
             } catch (e) { toast('保存失败: ' + e.message, true); }
+            btn.disabled = false;
         });
     });
 

@@ -400,6 +400,7 @@ enableServerPlugins: false
 # Attempt to automatically update server plugins on startup
 enableServerPluginsAutoUpdate: true
 enableInvitationCodes: false    # 启用邀请码系统
+enableRegistration: true        # 开放注册（关闭后隐藏注册入口；QRole 会员首次登录仍可自动开户）
 purchaseLink: ''                # 续费购买链接
 
 oauth:
@@ -418,6 +419,40 @@ oauth:
     clientId: ''
     clientSecret: ''
     callbackUrl: 'http://127.0.0.1:8000/api/stc/oauth/linuxdo/callback'
+  # QRole 会员登录（仅 VIP / SVIP 会员可登录）
+  qrole:
+    enabled: false
+    clientId: ''
+    clientSecret: ''
+    # 留空则按当前访问地址自动生成 /api/stc/oauth/qrole/callback
+    callbackUrl: ''
+    authUrl: 'https://www.qqy.one/api/oauth/authorize'
+    tokenUrl: 'https://www.qqy.one/api/oauth/token'
+    userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo'
+    scope: 'openid profile email'
+    # client_secret_post | client_secret_basic
+    tokenAuthMethod: 'client_secret_post'
+    usePkce: true
+    # 仅允许下列会员等级登录；设为 false 则任何 QRole 用户都可登录
+    requireMembership: true
+    # 以下列表不在此处提供默认值（升级合并默认配置时列表会按下标合并，可能改动自定义列表）；
+    # 未设置时使用内置默认值，如需自定义请取消注释后修改
+    # allowedTiers:
+    #   - vip
+    #   - svip
+    # userinfo 中会员等级 / 到期时间所在字段（按顺序取第一个存在的，支持 a.b 路径）
+    # tierClaims:
+    #   - membershipTierId
+    #   - membership_tier
+    #   - membership.tierId
+    #   - membership.tier
+    #   - tier
+    # expiryClaims:
+    #   - membershipExpiresAt
+    #   - membership_expires_at
+    #   - membership.expiresAt
+    # 会员状态复核间隔（小时）：超过后需重新使用 QRole 登录以确认会员仍有效；0 = 仅按已知到期时间和等级判断
+    reverifyHours: 24
 
 email:
   enabled: false
@@ -448,3 +483,39 @@ privacy:
     requireForApiKeys: true
     # 解锁后服务端内存密钥保留时间（分钟），默认 24 小时
     unlockTtlMinutes: 1440
+
+# -- 页面背景与站点信息（欢迎页 / 登录页 / 注册页）--
+# 修改后刷新页面即生效，无需重启；非法值会被忽略并改用默认值。
+site:
+  # 站点名：网页标题、欢迎页大标题、登录框 Logo 旁文字（最多 60 字，不能为空）
+  name: 'SillyTavern'
+  # 欢迎页顶部角标（最多 60 字；'' = 不显示）
+  badge: 'Silly Tavern'
+  # 欢迎页副标题（各最多 120 字；两行都为 '' 时不显示）
+  subtitle: 'AI 角色扮演与对话平台'
+  subtitle2: 'Creative · Immersive · Extensible'
+  # Logo：站内相对路径（如 img/logo.png，文件放在 public/img/）或 http(s) 地址
+  logoUrl: 'img/logo.png'
+  background:
+    # 电脑端背景视频（mp4，站内路径或 http(s) 地址）；'' = 改用 pcImageUrl
+    pcVideoUrl: 'https://t.alcy.cc/acg'
+    # 电脑端背景图片：pcVideoUrl 为 '' 时直接显示；有视频时作为视频加载前的封面和视频失败时的替代图
+    pcImageUrl: ''
+    # 手机端背景图片；'' = 改用 pcImageUrl
+    mobileImageUrl: 'https://t.alcy.cc/moemp'
+    # 未设置背景或背景加载失败时的底色：CSS 颜色或渐变（不支持 url()、引号和 ;）
+    fallback: 'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)'
+    # 背景暗色遮罩不透明度 0-1（0 = 不加遮罩）
+    overlayOpacity: 0.52
+    # 樱花飘落动画（false = 关闭）
+    sakura: true
+  # 欢迎页功能卡片（最多 8 个；features: [] = 不显示卡片）。
+  # 默认的 4 张卡片由 STC 在首次启动时写入 config.yaml（此处不预置数组，避免官方按下标合并默认值）。
+  # 自定义示例：
+  # features:
+  #   - icon: 'fa-solid fa-comments'   # Font Awesome 6 图标类名（小写字母、数字、空格、-，需含 fa-）
+  #     title: 'AI 对话'               # 标题（最多 30 字，必填）
+  #     text: '支持多种 LLM 模型'        # 说明（最多 80 字，可为 ''）
+  #   - icon: 'fa-solid fa-book'
+  #     title: '使用教程'
+  #     text: '新手请先阅读公告'
