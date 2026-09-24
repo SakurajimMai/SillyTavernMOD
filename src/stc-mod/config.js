@@ -31,7 +31,7 @@ function loadFullConfig() {
 
 /**
  * Get a STC-MOD specific config value.
- * Looks under config.yaml keys directly (e.g. 'enableForum', 'oauth.github.enabled', etc.)
+ * Looks under config.yaml keys directly (e.g. 'enableInvitationCodes', 'oauth.github.enabled', etc.)
  * @param {string} key Dot-separated key path
  * @param {*} defaultValue Default value if key not found
  * @returns {*}
@@ -79,8 +79,6 @@ export function setStcConfig(key, value) {
 export function ensureDefaultConfig() {
     const defaults = {
         enableInvitationCodes: false,
-        enableForum: false,
-        enablePublicCharacters: false,
         purchaseLink: '',
         oauth: {
             github: { enabled: false, clientId: '', clientSecret: '', callbackUrl: '' },

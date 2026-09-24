@@ -4,7 +4,6 @@
  */
 
 const EXEMPT_PATHS = [
-    '/api/stc/public-characters',
     '/api/stc/users/me',
     '/api/stc/users/heartbeat',
     '/api/stc/users/check-in',
@@ -14,7 +13,6 @@ const EXEMPT_PATHS = [
     '/api/stc/users/register',
     '/api/stc/users/send-verification',
     '/api/stc/invitation-codes/status',
-    '/api/stc/forum/upload-image',
     '/api/stc/oauth',
     '/api/stc/email/status',
     '/api/stc/announcements/login',
@@ -22,8 +20,6 @@ const EXEMPT_PATHS = [
 ];
 
 const EXEMPT_PREFIXES = [
-    '/api/stc/public-characters',
-    '/api/stc/forum/',
     '/api/stc/oauth/',
 ];
 
@@ -42,9 +38,6 @@ export function shouldSkipCsrf(req) {
     for (const prefix of EXEMPT_PREFIXES) {
         if (req.path.startsWith(prefix)) return true;
     }
-
-    // GET requests to forum API
-    if (req.method === 'GET' && req.path.startsWith('/api/stc/forum/')) return true;
 
     return false;
 }

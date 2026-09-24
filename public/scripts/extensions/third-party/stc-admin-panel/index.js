@@ -329,13 +329,12 @@ jQuery(async () => {
         injectAdminNavLink();
     }
 
-    // Step 2.5: Fetch public config and inject site nav links (forum / characters)
+    // Step 2.5: Fetch public config (purchase link)
     try {
         const cfgResp = await fetch('/api/stc/public-config/public-pages');
         if (cfgResp.ok) {
             const cfg = await cfgResp.json();
             _purchaseLink = cfg.purchaseLink || '';
-            injectSiteNavLinks(cfg);
         }
     } catch (e) {
         console.debug('[STC-MOD] Could not fetch public config:', e.message);
@@ -1863,102 +1862,6 @@ function injectAdminNavLink() {
             display:flex;align-items:center;gap:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);`;
         getStcHost().appendChild(btn);
     }
-}
-
-// ── Site Navigation Buttons (注入到欢迎界面按钮行) ──────────────
-/**
- * Build and return the STC nav bar element.
- * @param {{ enableForum: boolean, enablePublicCharacters: boolean }} cfg
- * @returns {HTMLElement|null}
- */
-function buildNavBar(cfg) {
-    const links = [
-        { id: 'stc-nav-home-btn',  icon: 'fa-house',         label: '首页',   href: '/',                  show: true },
-        { id: 'stc-nav-forum-btn', icon: 'fa-comments',      label: '论坛',   href: '/forum',             show: cfg.enableForum },
-        { id: 'stc-nav-chars-btn', icon: 'fa-masks-theater', label: '角色卡', href: '/public-characters', show: cfg.enablePublicCharacters },
-    ].filter(l => l.show);
-
-    if (!links.length) return null;
-
-    const bar = document.createElement('div');
-    bar.id = 'stc-quick-nav-bar';
-    // className will be overwritten in tryInjectNavIntoWelcome to match the official row
-    bar.className = 'flex-container';
-
-    links.forEach(link => {
-        const btn = document.createElement('button');
-        btn.id = link.id;
-        btn.className = 'menu_button menu_button_icon inline-flex';
-        btn.innerHTML = `<i class="fa-solid ${link.icon}"></i><span>${link.label}</span>`;
-        btn.addEventListener('click', () => window.open(link.href, '_blank'));
-        bar.appendChild(btn);
-    });
-
-    return bar;
-}
-
-/**
- * Try to inject nav bar into the welcome prompt area once.
- * The welcome prompt creates a .flex-container with .drawer-opener buttons.
- * @param {{ enableForum: boolean, enablePublicCharacters: boolean }} cfg
- * @returns {boolean} true if successfully injected
- */
-function tryInjectNavIntoWelcome(cfg) {
-    if (document.getElementById('stc-quick-nav-bar')) return true;
-
-    // The welcomePrompt renders a .flex-container containing .drawer-opener buttons
-    // (API Connections, Character Management, Extensions) inside #chat.
-    const chat = document.getElementById('chat');
-    if (!chat) return false;
-
-    // Find the container holding the welcomePrompt drawer-opener buttons.
-    // IMPORTANT: DOMPurify renames .flex-container → .custom-flex-container inside messages,
-    // but .drawer-opener on <button> is preserved (because it has .menu_button class).
-    // Strategy: find the button first, then walk up to its parent container.
-    const apiBtn = chat.querySelector(
-        'button.drawer-opener[data-target="sys-settings-button"], ' +
-        'button.drawer-opener[data-target="rightNavHolder"]',
-    );
-    if (!apiBtn) return false;
-
-    // The direct parent of the button group (custom-flex-container or flex-container)
-    const promptRow = apiBtn.parentElement;
-    if (!promptRow) return false;
-
-    const bar = buildNavBar(cfg);
-    if (!bar) return true; // nothing to inject, consider done
-
-    // Copy the same className from the official prompt row so both rows share
-    // identical flex/padding/margin styles (custom-flex-container or flex-container)
-    if (promptRow.className) {
-        bar.className = promptRow.className;
-    }
-    bar.id = 'stc-quick-nav-bar'; // restore id after className overwrite
-
-    // Inject as a sibling row directly after the welcome prompt row
-    promptRow.after(bar);
-    return true;
-}
-
-/**
- * Inject 首页/论坛/角色卡 buttons into the welcome panel prompt area.
- * Uses a MutationObserver to handle the case where the panel is rendered
- * asynchronously after the extension loads.
- * @param {{ enableForum: boolean, enablePublicCharacters: boolean }} cfg
- */
-function injectSiteNavLinks(cfg) {
-    // Try immediately (panel may already be present)
-    if (tryInjectNavIntoWelcome(cfg)) return;
-
-    // Watch #chat for the welcome prompt to appear
-    const chat = document.getElementById('chat') || document.body;
-    const obs = new MutationObserver(() => {
-        if (tryInjectNavIntoWelcome(cfg)) obs.disconnect();
-    });
-    obs.observe(chat, { childList: true, subtree: true });
-
-    // Safety timeout — disconnect after 60 s to avoid leaking observers
-    setTimeout(() => obs.disconnect(), 60000);
 }
 
 // ── Admin Panel Launcher ──────────────────────────────────────

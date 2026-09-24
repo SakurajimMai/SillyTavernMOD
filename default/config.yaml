@@ -400,8 +400,6 @@ enableServerPlugins: false
 # Attempt to automatically update server plugins on startup
 enableServerPluginsAutoUpdate: true
 enableInvitationCodes: false    # 启用邀请码系统
-enableForum: true              # 启用论坛
-enablePublicCharacters: true   # 启用公共角色卡库
 purchaseLink: ''                # 续费购买链接
 
 oauth:

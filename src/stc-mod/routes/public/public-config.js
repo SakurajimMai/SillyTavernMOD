@@ -10,8 +10,6 @@ export const router = express.Router();
 
 router.get('/public-pages', (req, res) => {
     res.json({
-        enableForum: !!getStcConfig('enableForum', false),
-        enablePublicCharacters: !!getStcConfig('enablePublicCharacters', false),
         enableInvitationCodes: !!getStcConfig('enableInvitationCodes', false),
         enableEmailVerification: isEmailServiceAvailable(),
         enableOAuthGithub: !!getStcConfig('oauth.github.enabled', false),

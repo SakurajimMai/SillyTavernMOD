@@ -172,15 +172,6 @@
     background: rgba(255, 255, 255, 0.06);
 }
 
-/* ── Welcome-prompt Site Nav Buttons (首页 / 论坛 / 角色卡库) ─── */
-/* Rendered as a sibling .flex-container row below the welcomePrompt buttons */
-#stc-quick-nav-bar {
-    /* Thin separator line between the official prompt row and our nav row */
-    border-top: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.08));
-    margin-top: 2px;
-    padding-top: 2px;
-}
-
 /* ── User Info Reveal dot (after closing widget) ─────────────── */
 #stc-user-info-reveal {
     display: none;

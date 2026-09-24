@@ -186,7 +186,6 @@
         }
         .btn-secondary:hover { background: rgba(200,140,255,.12); transform: translateY(-2px); border-color: rgba(200,140,255,.35); }
 
-        #extraLinks { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 14px; }
 
         /* ── Feature grid ── */
         .features {
@@ -267,7 +266,6 @@
         <a href="/login"    class="btn btn-primary"><i class="fa-solid fa-right-to-bracket"></i> 登录账号</a>
         <a href="/register" class="btn btn-secondary"><i class="fa-solid fa-user-plus"></i> 注册新账号</a>
     </div>
-    <div id="extraLinks"></div>
 
     <div class="features">
         <div class="feature"><i class="fa-solid fa-comments"></i><h3>AI 对话</h3><p>支持多种 LLM 模型</p></div>
@@ -325,29 +323,6 @@
     animate();
 })();
 
-/* ── Extra links ── */
-(async function() {
-    try {
-        const resp = await fetch('/api/stc/public-config/public-pages');
-        if (!resp.ok) return;
-        const config = await resp.json();
-        const container = document.getElementById('extraLinks');
-        if (config.enableForum) {
-            const a = document.createElement('a'); a.href = '/forum';
-            a.className = 'btn btn-secondary';
-            a.style.cssText = 'padding:11px 20px;font-size:.86em;border-radius:10px';
-            a.innerHTML = '<i class="fa-solid fa-comments"></i> 社区论坛';
-            container.appendChild(a);
-        }
-        if (config.enablePublicCharacters) {
-            const a = document.createElement('a'); a.href = '/public-characters';
-            a.className = 'btn btn-secondary';
-            a.style.cssText = 'padding:11px 20px;font-size:.86em;border-radius:10px';
-            a.innerHTML = '<i class="fa-solid fa-masks-theater"></i> 角色卡库';
-            container.appendChild(a);
-        }
-    } catch {}
-})();
 </script>
 </body>
 </html>

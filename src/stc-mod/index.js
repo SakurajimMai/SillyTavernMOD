@@ -80,18 +80,6 @@ export async function setupPublicRoutes(app) {
         return res.sendFile('register.html', { root: publicDir });
     });
 
-    // Forum page (configurable)
-    app.get('/forum', (req, res, next) => {
-        if (!getStcConfig('enableForum', false)) return next();
-        return res.sendFile('forum.html', { root: publicDir });
-    });
-
-    // Public characters page (configurable)
-    app.get('/public-characters', (req, res, next) => {
-        if (!getStcConfig('enablePublicCharacters', false)) return next();
-        return res.sendFile('public-characters.html', { root: publicDir });
-    });
-
     // Serve STC-MOD static assets
     app.use('/stc-assets', express.static(publicDir, { maxAge: '1d' }));
 
@@ -162,18 +150,6 @@ export async function setupPrivateRoutes(app) {
     // OAuth configuration (admin)
     const { router: oauthConfigRouter } = await import('./routes/private/oauth-config.js');
     app.use('/api/stc/oauth-config', oauthConfigRouter);
-
-    // Forum (configurable)
-    if (getStcConfig('enableForum', false)) {
-        const { router: forumRouter } = await import('./routes/private/forum.js');
-        app.use('/api/stc/forum', forumRouter);
-    }
-
-    // Public characters library (configurable)
-    if (getStcConfig('enablePublicCharacters', false)) {
-        const { router: publicCharsRouter } = await import('./routes/private/public-characters.js');
-        app.use('/api/stc/public-characters', publicCharsRouter);
-    }
 
     // System monitoring (admin)
     const { router: systemLoadRouter } = await import('./routes/private/system-load.js');
