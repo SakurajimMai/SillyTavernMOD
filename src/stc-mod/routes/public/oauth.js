@@ -49,6 +49,7 @@ const OAUTH_ERROR_CODES = new Set([
     'account_disabled',
     'registration_closed',
     'create_failed',
+    'provider_error',
     'server_error',
 ]);
 
@@ -76,7 +77,8 @@ const PROVIDER_DEFAULTS = {
         authUrl: 'https://www.qqy.one/api/oauth/authorize',
         tokenUrl: 'https://www.qqy.one/api/oauth/token',
         userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo',
-        scope: 'openid profile email',
+        // `membership` makes QRole's userinfo return membership_tier / membership_expires_at
+        scope: 'openid profile email membership',
     },
 };
 
@@ -130,7 +132,8 @@ function getEndpoint(provider, config, key) {
 }
 
 /**
- * Scope requested at the authorize endpoint ('' = none).
+ * Scope requested at the authorize endpoint ('' = none). QRole falls back to the default
+ * (including `membership`) when no scope is configured.
  * @param {string} provider
  * @param {object} config
  * @returns {string}
@@ -650,7 +653,14 @@ router.get('/:provider/callback', async (req, res) => {
 
     try {
         if (req.query.error) {
-            return redirectOauthError(res, 'denied');
+            // access_denied = the user declined on the provider's consent page; anything else
+            // (invalid_request, invalid_scope, ...) is a provider-side rejection, usually a misconfiguration
+            const providerError = typeof req.query.error === 'string' ? req.query.error.replace(/[^a-z_]/gi, '').slice(0, 64) : '';
+            if (providerError === 'access_denied') {
+                return redirectOauthError(res, 'denied');
+            }
+            console.warn(`[STC-MOD] OAuth ${logLabel} provider rejected the authorization request: ${providerError || 'unknown error'}`);
+            return redirectOauthError(res, 'provider_error');
         }
 
         if (!isValidFlow(flow, provider, req.query.state)) {

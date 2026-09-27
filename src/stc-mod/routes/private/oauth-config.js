@@ -152,6 +152,15 @@ router.post('/config', requireAdminMiddleware, (req, res) => {
                 }
                 entries[`${prefix}.${field}`] = list;
             }
+
+            // With the membership check on, QRole only returns the tier when the `membership`
+            // scope is requested; saving a scope without it would make every login fail.
+            const requireMembership = entries[`${prefix}.requireMembership`] ?? getStcConfig(`${prefix}.requireMembership`, true);
+            const scope = entries[`${prefix}.scope`] ?? getStcConfig(`${prefix}.scope`, '');
+            const scopeList = typeof scope === 'string' ? scope.split(/\s+/).filter(Boolean) : [];
+            if (requireMembership !== false && scopeList.length > 0 && !scopeList.includes('membership')) {
+                return res.status(400).json({ error: '开启「仅允许会员登录」时，scope 必须包含 membership（否则无法获取会员等级）' });
+            }
         }
 
         if (Object.keys(entries).length > 0 && !setStcConfigs(entries)) {

@@ -445,7 +445,8 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
 **QRole 登录提示「无法确认您的 QRole 会员状态，请联系管理员」**
 
 - QRole 返回的用户信息（userinfo）中找不到会员等级字段，或到期时间格式无法识别。服务器日志会出现 `[STC-MOD] QRole membership could not be determined; check oauth.qrole.tierClaims/expiryClaims. Userinfo claim keys: ...`，列出 userinfo 实际返回的字段名。
-- 在 STC 管理面板「OAuth 配置」→ QRole →「高级：会员字段映射」中，把「等级字段」「到期字段」改成对应的字段名后保存；或请 QRole 运营方在 userinfo 中返回会员等级。详见 [QRole 会员登录与注册开关](#qrole-会员登录与注册开关)。
+- 字段名中没有 `membership_tier`：说明授权范围缺少 `membership`。在 STC 管理面板「OAuth 配置」→ QRole 中把 Scope 改为 `openid profile email membership`（或清空以使用默认值）后保存，然后重新登录。
+- 字段名中有会员字段但名称不同（例如对接的不是 QRole 官方站点）：在「高级：会员字段映射」中把「等级字段」「到期字段」改成对应的字段名后保存。详见 [QRole 会员登录与注册开关](#qrole-会员登录与注册开关)。
 
 **登录提示「该账号尚未设置密码，为保护账号安全已禁止仅凭用户名登录，请联系管理员设置密码」**
 
@@ -481,7 +482,7 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
    - 关联了已停用登录方式的**管理员**账号不会被加固（日志会给出警告），请尽快为其手动设置密码。
 3. **没有密码的账号不能再仅凭用户名登录**（`default-user` 除外），例如早期注册时未填密码的用户。第一个请求之后，日志会列出这些账号：`[STC-MOD] 以下账号没有密码，已禁止仅凭用户名登录，请在用户管理中为其设置密码：...`。处理方法见 [常见问题](#7-常见问题)。
 4. **注册规则收紧**：本地注册必须设置 8–128 位密码；注册、发送验证码和第三方补全注册接口都需要 CSRF 令牌（自行编写脚本调用这些接口时，需先请求 `/csrf-token`，再在请求头中带上 `X-CSRF-Token`）；第三方登录的状态和待补全身份保存在服务端会话中，无法再伪造。
-5. **新配置项自动写入**：启动时自动补上 `enableRegistration`（默认 `true`）、`oauth.qrole`、`site`、`deployment.trustProxy`（默认 `false`）等缺失的配置项，已有的值不会被修改；重写后文件中的注释会消失。
+5. **新配置项自动写入**：启动时自动补上 `enableRegistration`（默认 `true`）、`oauth.qrole`、`site`、`deployment.trustProxy`（默认 `false`）等缺失的配置项，已有的值不会被修改；重写后文件中的注释会消失。唯一的例外：`oauth.qrole.scope` 仍是旧默认值 `openid profile email` 且开启了「仅允许会员登录」时，会自动改为 `openid profile email membership`（日志 `[STC-MOD] oauth.qrole.scope upgraded to ...`），否则 QRole 不返回会员信息、所有 QRole 登录都会被拒绝；自定义过的 Scope 不会被改动，请自行加上 `membership`。
 6. **`config.yaml` 改为原子写入**：STC-MOD 保存配置时先写临时文件再替换（保留 Docker 中的符号链接）；文件有语法错误时拒绝写入，运行中的服务继续使用最后一次正确的设置。拒绝写入时，「注册设置」「OAuth 配置」会提示保存失败；「邮件配置」「用户空间」「定时任务」和购买链接仍会显示保存成功，但实际没有写入。此时不要重启：带语法错误的 `config.yaml` 会让服务启动失败（`FATAL: Failed to read config.yaml...`，Docker 容器会不断重启），先修正语法再重启。
 7. **反代信任改为手动配置**：旧版的自动探测已移除，经反向代理用 HTTPS 部署时需在 `config.yaml` 中设置 `deployment.trustProxy`（见 [反向代理部署](#反向代理部署nginx--openresty--cloudflare)）。
 8. **Docker 用户要手动更新 STC 管理面板**：容器不会覆盖挂载目录中已有的 `stc-admin-panel`，更新镜像后请先删除宿主机上的 `extensions/stc-admin-panel` 再启动容器（见 [更新](#更新)）。
@@ -595,17 +596,37 @@ docker compose -f docker-compose.s3.yml restart juicefs sillytavern
 
 只有 **QRole VIP / SVIP 会员**可以用「QRole 会员登录」按钮直接进入本站；首次登录自动开户（即使已关闭注册、即使开启了邀请码），之后每次登录都会重新校验会员身份。
 
-**需要 QRole 方提供 / 确认的内容**（QRole 没有自助开发者后台，需找 QRole 运营方开通）：
+**QRole OAuth 对接约定**（QRole 已按下表提供，无需再向 QRole 确认字段格式）：
 
-1. 一个 OAuth 应用：`client_id`、`client_secret`，并登记回调地址 `https://<你的域名>/api/stc/oauth/qrole/callback`（必须与管理面板中填写的回调地址完全一致）。
-2. **`/api/oauth/userinfo` 必须返回会员等级**，例如 `membershipTierId`（`free` / `vip` / `svip`），最好同时返回到期时间 `membershipExpiresAt`。QRole 目前公开的授权范围（`openid profile email account:role …`）里没有会员信息；若 userinfo 不含会员等级，**所有人都会被拒绝登录**（提示「无法确认您的 QRole 会员状态」），服务器日志会列出 userinfo 实际返回的字段名，可在管理面板 QRole 配置的「高级：会员字段映射」中改成对应字段路径。
-3. 令牌端点的客户端认证方式（`client_secret_post` 或 `client_secret_basic`）以及是否支持 PKCE（默认开启 S256，不支持时可在面板关闭）。
+| 项目 | 约定 |
+|------|------|
+| 端点 | 授权 `https://www.qqy.one/api/oauth/authorize`、令牌 `https://www.qqy.one/api/oauth/token`、用户信息 `https://www.qqy.one/api/oauth/userinfo`；发现文档 `https://www.qqy.one/api/oauth/.well-known` |
+| 授权范围（scope） | 默认 `openid profile email membership`。`membership` 让 userinfo 返回会员信息，授权页显示为「查看会员状态」；缺少它时 userinfo 中没有会员字段，开启「仅允许会员登录」后**所有人都会被拒绝登录** |
+| 会员字段（需 `membership`） | `membership_tier`：当前**有效**等级，小写（`free` / `vip` / `svip`，或 QRole 配置的其他等级 id）；付费会员过期后 QRole 直接返回 `free`<br>`membership_expires_at`：付费会员到期时间，ISO-8601 UTC 字符串（如 `2026-12-31T16:00:00.000Z`）；仅 `free` 为 `null`（QRole 没有永久会员，付费等级总是带到期时间）<br>`membership_tier_name`：等级显示名，可能为 `null`（本站不使用） |
+| 其他字段 | `sub`（QRole 用户 id，用作账号绑定标识）；`name`、`preferred_username`、`picture`（`profile`）；`email`、`email_verified`（`email`）。QRole 的角色（`qrole_role`）本站不请求也不使用 |
+| PKCE | 支持 RFC 7636 **S256**（不支持 `plain`）；本站默认开启（`usePkce: true`），每次登录生成新的 `code_verifier` |
+| 客户端认证 | 令牌端点支持 `client_secret_post`（默认）或 `client_secret_basic`；只支持带 Client Secret 的机密客户端 |
+| 回调地址 | 必须与 QRole 登记的 `redirect_uris` **逐字符完全一致**（协议、域名、端口、路径，末尾不能多 `/`）：`https://<你的域名>/api/stc/oauth/qrole/callback`；未使用域名时如 `http://<服务器IP>:8000/api/stc/oauth/qrole/callback` |
 
-**配置步骤**：管理员登录 → STC 管理面板 → 「OAuth 配置」标签 → QRole：填写 Client ID / Secret、Callback URL（**部署在反向代理后必须填写完整 https 回调地址**；留空时按请求的协议与 Host 自动生成，依赖正确的 `deployment.trustProxy`），勾选「启用」和「仅允许会员登录」，「允许的会员等级」默认 `vip,svip`，保存后立即生效。
+默认的「等级字段」「到期字段」（`oauth.qrole.tierClaims` / `expiryClaims`）已包含 `membership_tier` / `membership_expires_at`，对接 QRole 时无需修改字段映射。
+
+**开通步骤**：
+
+1. **在 QRole 登记本站**（由 QRole 管理员操作，无需修改 QRole 的 `.env`、无需重启）：QRole 后台 → 「系统设置 → OAuth 应用」（`/admin/oauth-clients`）→「新建客户端」：
+   - 客户端 ID：如 `sillytavern-mod`（创建后不可改）；应用名称：如 `SillyTavernMOD`（显示在 QRole 授权页）。
+   - 回调地址：`http(s)://<本站地址>/api/stc/oauth/qrole/callback`，每行一个，可登记多个（例如同时登记域名地址和 `http://<服务器IP>:8000/...`），每个都必须与本站实际使用的回调地址逐字符一致。
+   - 勾选「强制 PKCE（S256）」：QRole 将拒绝本应用不带 PKCE 的授权请求，防止授权码被截获后冒用。本站默认就会发送 PKCE。
+   - 保存后客户端密钥**只显示一次**，立即复制；遗失后在该页面「重置密钥」并把新密钥填到本站。「停用」可随时关停本站的 QRole 登录。
+   - 需要 QRole 已升级到带「OAuth 应用」页面与 `membership` 范围的版本。QRole 仍兼容在其 `.env` 的 `OAUTH_CLIENTS_JSON` 中登记客户端（`"require_pkce": true`，改后需重新创建 QRole 容器），但不推荐。
+2. **在本站配置**：管理员登录 → STC 管理面板 → 「OAuth 配置」标签 → QRole：填写与上一步相同的 Client ID / Client Secret、Callback URL（**部署在反向代理后必须填写完整 https 回调地址**；留空时按请求的协议与 Host 自动生成，依赖正确的 `deployment.trustProxy`）；Scope 保持默认（留空即 `openid profile email membership`）；保持「启用 PKCE（S256）」勾选（QRole 端勾选「强制 PKCE（S256）」后，取消勾选将无法登录）；勾选「启用」和「仅允许会员登录」，「允许的会员等级」默认 `vip,svip`；保存后立即生效。
+3. **验证**：用 VIP / SVIP 账号点击登录页的「QRole 会员登录」，QRole 授权页的权限列表中应有「查看会员状态」，同意后直接进入本站；再用免费账号测试，应提示「仅 QRole VIP / SVIP 会员可以登录」。排查：
+   - QRole 页面显示 `invalid_client` 或 `redirect_uri is not allowed`：Client ID 或回调地址与 QRole 登记的不一致（回调地址须逐字符相同），或该客户端在 QRole 后台已停用。
+   - 用户没有拒绝授权，却回到本站登录页并提示「已取消授权」：QRole 拒绝了授权参数，通常是 Scope 含 QRole 不支持的范围（QRole 尚未升级到支持 `membership` 的版本，或 Scope 写错），或 QRole 端勾选了「强制 PKCE（S256）」而本站取消了「启用 PKCE（S256）」。`https://www.qqy.one/api/oauth/.well-known` 的 `scopes_supported` 应包含 `membership`，`code_challenge_methods_supported` 应为 `["S256"]`。
+   - 提示「无法从第三方获取账号信息，请稍后重试」：查看服务器日志中的 `[STC-MOD] OAuth qrole token ...` / `OAuth qrole userinfo ...`；`OAuth qrole token request failed: HTTP 401` 通常是 Client Secret 与 QRole 登记的不一致。
 
 **会员校验规则**：
 
-- 每次 QRole 登录都会检查：会员等级在允许列表内、未过期、QRole 账号状态为 active；否则拒绝并在登录页给出原因。
+- 每次 QRole 登录都会检查：会员等级在允许列表内、未过期、userinfo 若带有 `status` 字段则必须为 active；否则拒绝并在登录页给出原因。QRole 会把已过期的付费会员直接报告为 `free`，因此会员过期的用户登录时看到的是「仅 QRole VIP / SVIP 会员可以登录」。被 QRole 封禁或停用的账号，QRole 会拒绝返回其用户信息，同样无法登录本站。
 - 已登录的会话也会持续校验：已知到期时间一到、管理员从允许列表移除该等级时立即下线；另外每隔「会员状态复核间隔」（默认 24 小时，`oauth.qrole.reverifyHours`）需要重新用 QRole 登录一次以确认会员仍有效（页面刷新时按 24 小时，聊天等 API 请求有 48 小时宽限，避免对话中途被踢出）。设为 0 则只按已知到期时间和等级判断。
 - 为防止绕过会员校验，QRole 账号**不能用密码登录**；可以在「密码安全」中设置密码，但仅用于重置数据等确认操作。
 - QRole 的管理员角色不会映射成本站管理员。

@@ -429,9 +429,11 @@ oauth:
     authUrl: 'https://www.qqy.one/api/oauth/authorize'
     tokenUrl: 'https://www.qqy.one/api/oauth/token'
     userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo'
-    scope: 'openid profile email'
+    # 须包含 membership：QRole 据此在 userinfo 中返回会员等级 membership_tier 与到期时间 membership_expires_at
+    scope: 'openid profile email membership'
     # client_secret_post | client_secret_basic
     tokenAuthMethod: 'client_secret_post'
+    # PKCE（S256）：QRole 已支持，请保持开启（QRole 后台为本应用勾选「强制 PKCE」后，关闭将无法登录）
     usePkce: true
     # 仅允许下列会员等级登录；设为 false 则任何 QRole 用户都可登录
     requireMembership: true
@@ -440,7 +442,7 @@ oauth:
     # allowedTiers:
     #   - vip
     #   - svip
-    # userinfo 中会员等级 / 到期时间所在字段（按顺序取第一个存在的，支持 a.b 路径）
+    # userinfo 中会员等级 / 到期时间所在字段（按顺序取第一个存在的，支持 a.b 路径；默认已包含 QRole 的 membership_tier / membership_expires_at）
     # tierClaims:
     #   - membershipTierId
     #   - membership_tier

@@ -248,6 +248,28 @@ export function setStcConfig(key, value) {
     return setStcConfigs({ [key]: value });
 }
 
+/** QRole scope requested by default: `membership` makes QRole's userinfo return the membership claims. */
+const DEFAULT_QROLE_SCOPE = 'openid profile email membership';
+/** Default QRole scope written by earlier versions (no membership claims). */
+const LEGACY_QROLE_SCOPE = 'openid profile email';
+
+/**
+ * Upgrade the QRole scope still set to the old default: without `membership` QRole returns no
+ * membership claims, so the membership gate would deny every login. Custom scopes are left alone,
+ * and so is the old default while the gate is off (the claims are not needed then).
+ * @param {object} config Parsed config.yaml (changed in place)
+ * @returns {boolean} true if the scope was changed
+ */
+function migrateQroleScope(config) {
+    const qrole = config?.oauth?.qrole;
+    if (!qrole || typeof qrole !== 'object' || Array.isArray(qrole)) return false;
+    if (qrole.requireMembership === false || typeof qrole.scope !== 'string') return false;
+    if (qrole.scope.trim().split(/\s+/).join(' ') !== LEGACY_QROLE_SCOPE) return false;
+    qrole.scope = DEFAULT_QROLE_SCOPE;
+    console.log(`[STC-MOD] oauth.qrole.scope upgraded to '${DEFAULT_QROLE_SCOPE}' (required for the QRole membership check)`);
+    return true;
+}
+
 /**
  * Ensure default STC config values exist in config.yaml
  */
@@ -271,11 +293,12 @@ export function ensureDefaultConfig() {
                 authUrl: 'https://www.qqy.one/api/oauth/authorize',
                 tokenUrl: 'https://www.qqy.one/api/oauth/token',
                 userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo',
-                scope: 'openid profile email',
+                // membership：让 QRole userinfo 返回 membership_tier / membership_expires_at（会员校验必需）
+                scope: DEFAULT_QROLE_SCOPE,
                 // client_secret_post | client_secret_basic
                 tokenAuthMethod: 'client_secret_post',
                 usePkce: true,
-                // 仅允许下列 QRole 会员等级登录（membershipTierId）；关闭则任何 QRole 用户都可登录
+                // 仅允许下列 QRole 会员等级登录（userinfo 的 membership_tier）；关闭则任何 QRole 用户都可登录
                 requireMembership: true,
                 allowedTiers: ['vip', 'svip'],
                 // userinfo 中会员等级 / 到期时间所在字段（按顺序取第一个存在的，支持 a.b 路径）
@@ -359,6 +382,7 @@ export function ensureDefaultConfig() {
     }
 
     mergeDefaults(config, defaults);
+    if (migrateQroleScope(config)) changed = true;
 
     if (changed) {
         if (writeConfigFile(config)) {

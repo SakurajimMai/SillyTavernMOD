@@ -959,7 +959,7 @@ const OAUTH_ENDPOINT_DEFAULTS = {
 };
 
 const QROLE_DEFAULTS = {
-    scope: 'openid profile email',
+    scope: 'openid profile email membership',
     tokenAuthMethod: 'client_secret_post',
     allowedTiers: ['vip', 'svip'],
     tierClaims: ['membershipTierId', 'membership_tier', 'membership.tierId', 'membership.tier', 'tier'],
@@ -1039,6 +1039,7 @@ async function renderOAuthTab(container) {
     const qroleExtra = `
         <div class="stc-form-row"><label>Scope:</label>
           <input class="stc-oauth-scope" data-provider="qrole" type="text" placeholder="${QROLE_DEFAULTS.scope}"></div>
+        <div class="stc-oauth-hint">空格分隔；留空使用默认值。开启「仅允许会员登录」时必须包含 membership（QRole 据此返回会员等级与到期时间），否则所有人都会被拒绝登录。</div>
         ${endpointRows('qrole')}
         <div class="stc-form-row"><label>Token 认证方式:</label>
           <select class="stc-oauth-tokenauth" data-provider="qrole">

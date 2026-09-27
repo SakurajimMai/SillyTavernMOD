@@ -414,9 +414,9 @@ oauth:
     authUrl: 'https://www.qqy.one/api/oauth/authorize'
     tokenUrl: 'https://www.qqy.one/api/oauth/token'
     userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo'
-    scope: 'openid profile email'
+    scope: 'openid profile email membership'   # membership：QRole userinfo 返回 membership_tier / membership_expires_at
     tokenAuthMethod: client_secret_post   # 或 client_secret_basic
-    usePkce: true
+    usePkce: true                # PKCE S256（QRole 端可对本应用勾选「强制 PKCE」）
     requireMembership: true      # 仅允许 allowedTiers 中的会员登录
     allowedTiers: [vip, svip]    # 由 STC 自动写入；default/config.yaml 中不预置数组（避免 lodash 按下标合并）
     tierClaims: [membershipTierId, membership_tier, membership.tierId, membership.tier, tier]
@@ -647,6 +647,18 @@ enableDownloadableTokenizers: false
 | `stc-admin-panel/admin-panel.js`、`index.js` | OAuth 标签新增 QRole 配置；「注册设置」开关；密码安全卡片与 QRole 会话下线提示 |
 
 升级 SillyTavern 时需额外确认：官方 `POST /api/users/login` 仍挂在 `app.use('/api/users', …)` 下（QRole 密码登录拦截依赖相同挂载路径），`setUserDataMiddleware` 仍在 STC `setupPublicRoutes` 之前执行（会话校验依赖 `req.user`），`getAccountVersion` / `getPasswordSalt` 仍从 `src/users.js` 导出。
+
+### QRole `membership` 授权范围适配
+
+QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有效等级，小写；过期的付费会员为 `free`）、`membership_tier_name`、`membership_expires_at`（ISO-8601 UTC，仅 `free` 为 `null`），并支持 PKCE S256（客户端可设「强制 PKCE」）；QRole 管理员在后台「系统设置 → OAuth 应用」创建本站客户端，无需修改 QRole 的 `.env`。STC 侧改动：
+
+| 文件 | 说明 |
+|------|------|
+| `config.js` | `oauth.qrole.scope` 默认值改为 `openid profile email membership`；启动时若该值仍是旧默认 `openid profile email` 且 `requireMembership` 未关闭，自动升级为新默认（日志 `oauth.qrole.scope upgraded`），自定义 Scope 不改动 |
+| `routes/public/oauth.js` | `PROVIDER_DEFAULTS.qrole.scope`（`scope` 留空时的回退值）同步为 `openid profile email membership`；PKCE（S256）流程不变 |
+| `default/config.yaml` | 新安装的 `oauth.qrole.scope` 默认值同上，并注明 `membership` 与 PKCE 的作用 |
+| `stc-admin-panel/admin-panel.js` | QRole Scope 输入框占位符改为新默认值，并提示「仅允许会员登录」时必须包含 `membership` |
+| `services/qrole-membership.js` | 未改动：默认等级 / 到期字段已包含 `membership_tier` / `membership_expires_at`，ISO 时间字符串与 `null` 均已支持 |
 
 ## 页面背景与站点信息（`site` 配置）
 
