@@ -327,7 +327,7 @@ app.use(express.static(path.join(serverDirectory, 'public'), {
 src/stc-mod/
 ├── index.js                         # 模块入口（5个导出函数）
 ├── config.js                        # 配置系统（读写 config.yaml）
-├── user-metadata.js                 # 扩展用户数据存储
+├── user-metadata.js                 # 扩展用户数据存储（内存缓存 + 分级刷盘）
 ├── middleware/
 │   ├── csrf-exemption.js            # CSRF 豁免规则
 │   ├── trust-proxy.js               # 反代 trust proxy 配置
@@ -371,9 +371,15 @@ src/stc-mod/
 │   ├── qrole-export.js              # QRole 仅导出数据会话
 │   ├── qrole-cleanup.js             # QRole 账号列表与过期账号自动清理
 │   ├── user-deletion.js             # 删除账号（记录 + 数据目录 + 元数据），路由与清理任务共用
+│   ├── flush-scheduler.js           # 两级刷盘调度（活跃时间 60 s / 真实变更 5 s，单计时器，可注入时钟）
+│   ├── settings-safeguard.js        # POST /api/settings/get 前补齐缺失的 settings.json
+│   ├── user-content-seed.js         # 新账号默认内容（newUserContent: full / minimal）与 settings.json 补齐
 │   └── default-template.js          # 默认用户模板
 ├── tests/
-│   └── qrole-lifecycle.test.mjs     # QRole 到期处理纯逻辑测试（node 直接运行）
+│   ├── qrole-lifecycle.test.mjs     # QRole 到期处理纯逻辑测试（node 直接运行）
+│   ├── user-metadata-flush.test.mjs # user-metadata.json 刷盘策略测试（假时钟 / 模拟计时器 + 临时目录）
+│   ├── settings-safeguard.test.mjs  # settings.json 保护测试（临时目录 + 默认 settings.json 补齐）
+│   └── user-content-seed.test.mjs   # 新账号默认内容与补齐测试（临时目录 + 官方内容索引）
 └── public/
     ├── login.html                   # 自定义登录页（含 OAuth 按钮）
     ├── register.html                # 注册页
@@ -388,6 +394,7 @@ src/stc-mod/
 | 文件/目录 | 内容 |
 |-----------|------|
 | `user-metadata.json` | 扩展用户字段（OAuth ID、邮箱、过期时间、存储限额、密码状态、QRole 会员快照与加密的刷新令牌等） |
+| `user-metadata.json.bak` | 上一份 `user-metadata.json`，只在写入真实变更时刷新（即最近一次真实变更之前的状态，`lastActiveAt` 可能较旧）；主文件损坏时自动从它恢复 |
 | `invitation-codes.json` | 邀请码数据 |
 | `storage-codes.json` | 存储激活码数据 |
 | `announcements/` | 公告数据 |
@@ -732,6 +739,27 @@ QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有
 - 生产环境数据根目录在 JuiceFS 上：被自动清理删除的文件会先进入 JuiceFS 回收站（`JFS_TRASH_DAYS`，默认 7 天），代码不依赖回收站。
 
 升级 SillyTavern 时需额外确认：`createBackupArchive(handle, res)` 仍从 `src/users.js` 导出且仍在未开启 `allowKeysExposure` 时排除 `secrets.json`；`backups.allowFullDataBackup` 仍是官方完整备份开关；`setUserDataMiddleware` 只根据 `req.session.handle` 识别登录用户（导出会话依赖这一点）；`/csrf-token` 仍在登录中间件之前（导出页面退出需要 CSRF 令牌）。
+
+## 对象存储写入优化（元数据刷盘策略、新用户默认内容与 settings.json 保护）
+
+生产数据根目录位于 JuiceFS（Backblaze B2）：每次整文件改写都会上传新数据块，旧版本进入 JuiceFS 回收站。全部实现位于 `src/stc-mod/`，**未修改官方文件，也未新增 `server-main.js` 钩子**。
+
+| 文件 | 说明 |
+|------|------|
+| `services/flush-scheduler.js`（新增） | `createFlushScheduler({ flush, realDelayMs, activityDelayMs, retryDelayMs?, clock?, onError? })`：待写状态 `none` → `activity` → `real`（只升不降，写入后归零）；单个 unref 计时器，截止时间取最早者（真实变更把待写的活跃时间提前到 5 s 内，活跃心跳不会推迟已排定的写入，也不会延长 60 s 窗口）；截止时间使用单调时钟（`performance.now()`，与计时器一致），系统时间跳变（NTP 校时、虚拟机恢复）不会把真实变更推迟到 60 s；`flushNow()` 同步写入全部待写内容；`flush` 回调返回 `false` / 抛错时保留待写状态并在 `retryDelayMs`（默认 60 s）后重试。无文件 I/O，时钟与计时器可注入 |
+| `user-metadata.js` | `FLUSH_DEBOUNCE_MS = 5000`、`ACTIVITY_FLUSH_MS = 60_000`；`setUserMeta()` 的补丁只含 `lastActiveAt` 时（`isActivityOnlyPatch()`，即 `recordActivity()` / 心跳）按活跃变更处理，其余（含 `recordLogin()` 的 `lastLoginAt`、`unsetUserMetaFields()`、`deleteUserMeta()`、迁移）为真实变更；`immediate: true`、`flushMetadata()`（现返回是否成功）、`invalidateCache()` 与 `exit` / `SIGINT` / `SIGTERM` 钩子都会同步写入全部待写内容（含活跃时间）；写入仍为临时文件 + rename，`.bak` 只在包含真实变更的写入时刷新。主文件无法解析（或不是 JSON 对象）时从 `.bak` 恢复，恢复后下一次写入不会用损坏的主文件覆盖 `.bak`；`.bak` 也不可用时，两个文件改名保留为 `<文件名>.corrupt-<时间戳>`（改名失败则复制），元数据从空开始。`invalidateCache()` 写入失败时保留缓存（改动仍待写、已安排重试）并返回 `false`。`SIGINT` / `SIGTERM` 钩子写入后，只在没有其他监听器时才 `process.exit(0)`：官方 `server-main.js` 的 `exitProcess`（统计、插件清理、磁盘缓存）随后照常执行，其 `process.exit()` 触发 `exit` 钩子再写一次（无待写内容时不写）。新增 `getMetadataFlushState()`（诊断 / 测试，`dueAt` 为单调时钟毫秒）。内存缓存仍是唯一数据源，读取立即可见 |
+| `services/user-content-seed.js`（新增） | 新账号 / 重置账号的默认内容。`config.yaml` 顶层 `newUserContent`（每次注册时读取，无需重启）：`full`（默认，官方行为）或 `minimal`。`seedNewUserContent(directories)`：`minimal` 时先写 `content.log`（列出除 SETTINGS / AVATAR 类型与 `default/scaffold` 内容之外的全部用户级默认内容，`wx` 从不覆盖），再调用与官方创建用户相同的 `checkForNewContent([directories], [CONTENT_TYPES.SETTINGS])`，官方逻辑因此只复制 `settings.json`、`User Avatars/user-default.png` 与 scaffold 内容（以及全局内容）；`full` 时直接调用官方逻辑；写 `content.log` 失败时回退为完整内容。`restoreUserSettings(directories)`（settings.json 保护使用）：`minimal` 且 `content.log` 不存在（官方重置账号）时按新账号处理，否则只复制缺失的默认 `settings.json` 与默认用户头像（`COPYFILE_EXCL`，从不覆盖、不改 `content.log`），**从不** 复制完整默认内容。默认内容索引按官方 `getContentIndex` 的方式读取 `default/scaffold/index.json` 与 `default/content/index.json`（该函数未导出） |
+| `routes/public/register-helper.js` | `ensureUserDirectories()` 改为调用 `seedNewUserContent(directories)`（本地注册与 OAuth / QRole 注册共用） |
+| `services/settings-safeguard.js`（新增） | `ensureUserSettingsFile`：`req.user.directories` 存在、用户根目录存在而 `settings.json` 缺失时，`await restoreUserSettings(directories)`（见上），每次补齐记录一条日志，同一用户的并发请求共用一次补齐；然后 `next()`。任何错误只记录日志，从不抛出；文件存在、未登录或根目录不存在（账号正在删除）时不做任何事。`createEnsureUserSettingsFile({ seed })` 供测试注入 |
+| `index.js` | `setupPublicRoutes` 中紧接 QRole 会话校验之后，以挂在 `/api/settings` 上的路由器注册 `POST /get` → `ensureUserSettingsFile`（与官方 `settingsRouter` 相同的挂载与匹配语义），在官方处理器之前执行 |
+
+背景：`skipContentCheck: true` 时，官方 `POST /api/users/reset-step2` 删除用户根目录后调用未强制 SETTINGS 的 `checkForNewContent([directories])`，该调用直接返回，用户没有 `settings.json`，官方 `POST /api/settings/get` 读取失败返回 500。官方创建用户（`users-admin.js` 与 STC 注册共用的 `checkForNewContent([directories], [SETTINGS])`）会复制 `content.log` 中未记录的 **全部** 默认内容（约 190 个文件、约 15 MiB），`skipContentCheck` 只跳过启动时对所有用户的内容检查（每个用户每次启动改写一次 `content.log`）与账号重置后的补齐，不减少新用户的默认内容，因此另设 `newUserContent: minimal`。settings.json 保护若沿用官方补齐，重置后的第一次 `settings/get` 会在请求中同步复制全部默认内容（对象存储上阻塞整个服务器），因此只补 `settings.json` 与默认头像。官方管理员「创建用户」（`/api/users/create`）不经过 STC，仍复制完整默认内容。
+
+升级 SillyTavern 时需额外确认：`src/endpoints/content-manager.js` 仍导出 `checkForNewContent(directoriesList, forceCategories)`、`getUserTargetByType(type, directories)` 与 `CONTENT_TYPES`（`SETTINGS`、`AVATAR`），`seedContent` 仍跳过 `content.log` 中已记录（且未被强制）的条目并把 `content.log` 存为以换行分隔的文件名，默认内容索引仍为 `default/scaffold/index.json` 与 `default/content/index.json`（`[{ filename, type }]`），`src/constants.js` 仍导出 `SETTINGS_FILE`，`src/util.js` 仍导出 `setPermissionsSync`，官方设置接口仍为 `app.use('/api/settings', …)` 下的 `POST /get` 并从 `request.user.directories.root` 读取 `settings.json`，`setUserDataMiddleware` 仍在 `setupPublicRoutes` 之前执行；`server-main.js` 仍在加载 STC 模块之后才注册 `SIGINT` / `SIGTERM` 的 `exitProcess` 并以 `process.exit()` 结束。
+
+其他周期性写入（已检查，未修改）：`services/system-monitor.js` 每 5 分钟改写 `system-monitor-history.json`（最多 288 个点）并复制一份 `.bak`；`services/qrole-cleanup.js` 每小时检查、每 24 小时最多运行一次并写入状态 / 日志；`routes/private/scheduled-tasks.js` 每分钟检查，仅在备份清理到期时写 `config.yaml`。以上均不高于每 5 分钟一次。
+
+测试：`node src/stc-mod/tests/user-metadata-flush.test.mjs`、`node src/stc-mod/tests/settings-safeguard.test.mjs`、`node src/stc-mod/tests/user-content-seed.test.mjs`（不需要启动服务器，不访问网络；元数据测试的模拟计时器需要 Node ≥ 20.11）。
 
 ## 页面背景与站点信息（`site` 配置）
 

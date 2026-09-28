@@ -279,10 +279,10 @@ Go to: http://127.0.0.1:8000/ to open SillyTavern
 | 开放注册 / 邀请码 | STC 管理面板「邀请码」→「注册设置」；邀请码功能需 `config.yaml` 中 `enableInvitationCodes: true` | 默认开放注册、不要求邀请码（见 [关闭注册](#关闭注册)） |
 | QRole 会员登录 | STC 管理面板「OAuth 配置」→ QRole | 需要 QRole 运营方开通 OAuth 应用（见 [QRole 会员登录与注册开关](#qrole-会员登录与注册开关)） |
 | 邮件 | STC 管理面板「邮件配置」；`config.yaml` → `email.siteUrl`（邮件中的站点链接） | 保存后可发送测试邮件验证 |
-| 存储配额 | STC 管理面板「用户空间」（`userStorage`） | 默认启用，每个用户（包括管理员）上限 50 MiB，超出后写入返回 HTTP 507；新账号自带约 15 MiB 默认内容（默认背景图、示例角色等），实际可用约 35 MiB；保存后建议重启 |
+| 存储配额 | STC 管理面板「用户空间」（`userStorage`） | 默认启用，每个用户（包括管理员）上限 50 MiB，超出后写入返回 HTTP 507；新账号自带约 15 MiB 默认内容（默认背景图、示例角色等），实际可用约 35 MiB（设置 `newUserContent: minimal` 后新注册账号只带约 80 KB，见 [减少对象存储写入](#6-减少对象存储写入)）；保存后建议重启 |
 | API 密钥保险箱 | `config.yaml` → `privacy.secretsVault.requireForApiKeys`（默认 `true`） | 用户须先在个人面板「API 密钥保险箱」中启用并解锁，才能保存 API 密钥；解锁状态只保存在内存中，服务重启或超过 `privacy.secretsVault.unlockTtlMinutes`（默认 1440 分钟，即 24 小时）后需重新解锁（见 [API 密钥保险箱](#api-密钥保险箱与-requireforapikeys)） |
 | 内网访问防护（可选） | `config.yaml` → `privateAddressWhitelist.enabled: true` | 官方建议在对不受信任的用户开放时启用，阻止服务器代为访问内网地址（本机 `127.0.0.1` 默认放行）；启用后用户无法连接内网中的模型服务 |
-| 数据存到 S3 | `docker/docker-compose.s3.yml` | 见 [用户数据存储到 S3](#用户数据存储到-s3r2--b2juicefs) |
+| 数据存到 S3 | `docker/docker-compose.s3.yml` | 见 [用户数据存储到 S3](#用户数据存储到-s3r2--b2juicefs)；建议同时设置 `skipContentCheck: true` 与 `newUserContent: minimal`（见 [减少对象存储写入](#6-减少对象存储写入)） |
 
 ### 5. STC 管理面板
 
@@ -579,11 +579,40 @@ docker compose -f docker-compose.s3.yml restart juicefs sillytavern
 
 恢复到的是最近一次备份时的状态（最多丢失约 1 小时的改动）；使用云数据库自带的自动备份 / 时间点恢复可以更精确。
 
+### 6. 减少对象存储写入
+
+JuiceFS 每次改写文件都会上传新的数据块，被替换的旧版本还会在回收站保留 `JFS_TRASH_DAYS` 天，因此频繁整文件改写既耗上传也占回收站空间。
+
+**用户活跃时间（STC-MOD 自动处理，无需配置）**：每个打开的页面每 60 秒发送一次心跳，更新 `data/stc-mod/user-metadata.json` 中该用户的 `lastActiveAt`。
+
+- 只有活跃时间变化时，该文件 **最多每 60 秒写入一次**（期间所有心跳合并为一次写入），并且 **不刷新** `user-metadata.json.bak`。
+- 其他真实变更（注册、改密、续期、存储配额、QRole 会员状态等）仍在 5 秒内写入；登录、删除账号、修改到期时间等本来就立即写入的操作不变。活跃时间待写入期间发生真实变更时，两者在 5 秒内一起写入。
+- 正常停止（`docker stop`、Ctrl+C、SIGTERM）时会写入所有未保存的改动；进程被强制杀死（`kill -9`、内存不足）时最多丢失约 1 分钟的活跃时间，其他数据最多丢失 5 秒内的改动（与以前相同）。
+- `user-metadata.json.bak` 只在写入真实变更时更新，保存的是 **最近一次真实变更之前** 的状态（其中的 `lastActiveAt` 可能较旧）；主文件损坏时启动会自动从它恢复。主文件和 `.bak` 都无法读取时，元数据从空开始，原文件改名保留为 `user-metadata.json.corrupt-<时间戳>`（以及 `user-metadata.json.bak.corrupt-<时间戳>`），可手工修复后改回原名再重启。
+
+**`skipContentCheck: true`（推荐）**：在 `config.yaml`（Docker：`docker/config/config.yaml`）中设置，重启生效。
+
+- 启动时不再为每个用户检查默认内容。关闭时（官方默认 `false`），每次启动都会为 **每个用户** 改写一次 `content.log`（用户越多，每次重启的写入越多），升级 SillyTavern 带来的新默认内容也会复制进所有用户的目录。
+- 它 **不会** 减少新用户的默认内容：官方创建用户时会强制补齐 SETTINGS 类别，而官方的补齐逻辑会一并复制 `content.log` 中尚未记录的所有默认内容（约 190 个文件、约 15 MiB：默认背景、示例角色、各类预设、主题等），这些文件同样计入用户的存储配额。要减少这部分，请同时设置下面的 `newUserContent: minimal`。
+
+**`newUserContent: minimal`（对象存储推荐，STC-MOD 配置）**：在 `config.yaml` 顶层加一行 `newUserContent: minimal`，无需重启，对之后注册的账号生效；不设置或设为 `full` 时与官方相同（完整默认内容）。
+
+- 通过 STC 注册的新账号（本地注册、GitHub / Discord / Linux.do、QRole）只得到 `settings.json`、它引用的默认用户头像 `User Avatars/user-default.png` 和 `content.log`（约 80 KB），没有默认背景、示例角色、各类预设和主题；运营方放在 `default/scaffold` 中的自定义内容仍会复制。在 JuiceFS / B2 上注册只需写入这几个文件，不再上传约 190 个文件。
+- 其余默认内容会全部记入该用户的 `content.log`（视为已提供），因此之后的「重置设置」、settings.json 保护以及 `skipContentCheck: false` 时的启动检查都不会再补回这些文件；升级 SillyTavern 新增的默认内容在 `skipContentCheck: false` 时仍会照常复制。
+- 已有账号不受影响；管理员在官方「管理用户」中创建的账号仍得到完整默认内容。
+- 用户仍可随时在界面中手动导入预设、主题、背景和角色卡；需要统一的预设时，可用 STC 管理面板的默认用户模板。
+
+**settings.json 保护（STC-MOD 自动处理）**：官方「重置账号」在 `skipContentCheck: true` 时只重建空目录，不会重新生成 `settings.json`，导致官方 `POST /api/settings/get` 返回 500、界面无法加载（STC 管理面板的「重置用户」也会删除 `settings.json`）。
+
+- 已登录用户请求设置时若 `settings.json` 不存在，STC-MOD 会先补回默认的 `settings.json`（以及缺失的默认用户头像），日志中记录一次 `[STC-MOD] settings.json of <用户名> was missing ... restored the default settings.`，然后继续交给官方接口处理。
+- 只补这两个文件，**不会** 重新复制约 190 个默认文件（那样会在请求中同步上传约 15 MiB、阻塞整个服务器）；已有文件从不覆盖。`newUserContent: minimal` 时，若 `content.log` 也不存在（官方重置账号），会像新注册账号一样写入 `content.log`。
+- 文件存在或未登录时不做任何事；补齐失败只记录日志，不影响请求。
+
 ### 注意事项
 
 - 元数据库中保存着 S3 访问密钥（JuiceFS 社区版明文保存），请限制数据库访问来源；`docker/s3.env` 保持仅 root 可读。二者均已加入 `.gitignore` / `.dockerignore`。
 - 在 R2 / B2 控制台里看到的是 `<JFS_NAME>/chunks/...` 数据块，不是一个个角色卡文件；查看或导出文件请通过 `docker/juicefs/mnt/fs/data` 或 SillyTavern 本身。
-- 不要在存储桶上开启会自动删除/转存对象的生命周期规则；删除的文件会先进入 JuiceFS 回收站（默认 7 天，`JFS_TRASH_DAYS`；该值只在首次格式化时生效，之后修改 `s3.env` 不起作用）。
+- 不要在存储桶上开启会自动删除/转存对象的生命周期规则；删除或被覆盖的文件会先进入 JuiceFS 回收站（默认 7 天，`JFS_TRASH_DAYS`；juicefs 容器每次启动都会按 `s3.env` 同步，修改后执行 `docker compose up -d --force-recreate juicefs sillytavern` 生效；酒馆每次保存都会产生旧版本，访问量大时可设为 1–2 天）。
 - 启动顺序已做保护：SillyTavern 会等待 JuiceFS 挂载就绪后才启动（即使服务器重启后 Docker 以任意顺序拉起容器），不会把数据误写到本地目录。
 - JuiceFS 容器重启后需同时重启 SillyTavern：`docker compose -f docker-compose.s3.yml restart juicefs sillytavern`。
 - 如需把数据加密后再上传（桶内数据对服务商不可读），可在首次启动前参考 JuiceFS 文档启用 `--encrypt-rsa-key`；私钥丢失将无法恢复数据。

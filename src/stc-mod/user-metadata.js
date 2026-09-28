@@ -4,30 +4,82 @@
  * Does NOT modify the official users.js user model.
  *
  * Persistence design:
- * - A single in-memory cache (`metadataCache`) is the source of truth at runtime.
- * - Writes are coalesced and flushed asynchronously to avoid rewriting the whole
- *   JSON file on every high-frequency update (e.g. heartbeats).
+ * - A single in-memory cache (`metadataCache`) is the source of truth at runtime; readers see
+ *   every update immediately, disk writes happen later.
+ * - Writes are coalesced (services/flush-scheduler.js) because the whole JSON file is rewritten on
+ *   every flush and the data root may be remote object storage (JuiceFS on B2: each rewrite uploads
+ *   new chunks and keeps the replaced version in the trash):
+ *   - activity-only changes (`lastActiveAt` from heartbeats) are flushed at most once per
+ *     ACTIVITY_FLUSH_MS (60 s);
+ *   - real changes are flushed within FLUSH_DEBOUNCE_MS (5 s), also when activity was already
+ *     pending (the earlier deadline wins);
+ *   - `immediate: true`, flushMetadata() and the exit/SIGINT/SIGTERM hooks flush everything now.
  * - Disk writes are atomic (write to a temp file, then rename) so a crash or a
  *   concurrent write can never leave a half-written / corrupted metadata file.
+ * - `user-metadata.json.bak` is refreshed (copy of the current file) only by flushes that contain a
+ *   real change, so it holds the last state before the most recent real change; its
+ *   `lastActiveAt` values may be older. A corrupted main file is recovered from it on load; when
+ *   there is no usable `.bak` either, the unreadable file(s) are kept as `<name>.corrupt-<timestamp>`
+ *   and the store starts empty.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { getStcDataDir } from './config.js';
+import { createFlushScheduler } from './services/flush-scheduler.js';
 
 const METADATA_FILE = 'user-metadata.json';
 
-// How long to wait before flushing coalesced writes to disk (ms).
-const FLUSH_DEBOUNCE_MS = 5000;
+/** How long to wait before flushing coalesced real changes to disk (ms). */
+export const FLUSH_DEBOUNCE_MS = 5000;
+/** Activity-only changes (lastActiveAt) are written at most this often (ms). */
+export const ACTIVITY_FLUSH_MS = 60_000;
+/** Fields whose updates alone are activity-only changes (see setUserMeta). */
+const ACTIVITY_ONLY_KEYS = new Set(['lastActiveAt']);
 
 /** @type {Object<string, UserExtendedData>|null} */
 let metadataCache = null;
-/** @type {NodeJS.Timeout|null} */
-let flushTimer = null;
-/** Whether the cache has unsaved changes. */
-let dirty = false;
+/**
+ * Set after the store was recovered from `.bak` because the main file could not be parsed: the next
+ * write must not copy the broken main file over the (good) `.bak`.
+ */
+let skipNextBackup = false;
 
 function getMetadataPath() {
     return path.join(getStcDataDir(), METADATA_FILE);
+}
+
+/**
+ * Read and parse a metadata file (must hold a JSON object).
+ * @param {string} file
+ * @returns {Object<string, UserExtendedData>}
+ */
+function readMetadataFile(file) {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('not a JSON object');
+    }
+    return parsed;
+}
+
+/**
+ * Move an unreadable metadata file aside (`<name>.corrupt-<timestamp>`) before the store is reset,
+ * so its raw bytes can still be repaired by hand. Best effort: falls back to a copy.
+ * @param {string} file
+ */
+function setAsideUnreadable(file) {
+    if (!fs.existsSync(file)) return;
+    const target = `${file}.corrupt-${Date.now()}`;
+    try {
+        fs.renameSync(file, target);
+    } catch {
+        try {
+            fs.copyFileSync(file, target);
+        } catch (e) {
+            console.error(`[STC-MOD] Could not keep a copy of the unreadable ${path.basename(file)}:`, e.message);
+            return;
+        }
+    }
+    console.error(`[STC-MOD] Kept the unreadable ${path.basename(file)} as ${target}`);
 }
 
 function loadMetadata() {
@@ -38,20 +90,28 @@ function loadMetadata() {
         return metadataCache;
     }
     try {
-        metadataCache = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        metadataCache = readMetadataFile(filePath);
     } catch (e) {
         console.error('[STC-MOD] Failed to read user metadata:', e.message);
         // Try to recover from the last good backup rather than silently dropping all data.
+        const backup = filePath + '.bak';
+        let recovered = null;
         try {
-            const backup = filePath + '.bak';
-            if (fs.existsSync(backup)) {
-                metadataCache = JSON.parse(fs.readFileSync(backup, 'utf8'));
-                console.warn('[STC-MOD] Recovered user metadata from backup.');
-                migrateLastActiveAt();
-                return metadataCache;
-            }
-        } catch { /* fall through */ }
-        metadataCache = {};
+            if (fs.existsSync(backup)) recovered = readMetadataFile(backup);
+        } catch (backupError) {
+            console.error('[STC-MOD] User metadata backup is unreadable too:', backupError.message);
+        }
+        if (recovered) {
+            metadataCache = recovered;
+            skipNextBackup = true;
+            console.warn('[STC-MOD] Recovered user metadata from backup.');
+        } else {
+            // No usable backup: the store starts empty. Keep the unreadable files (main and .bak)
+            // instead of letting the next writes replace them.
+            setAsideUnreadable(filePath);
+            setAsideUnreadable(backup);
+            metadataCache = {};
+        }
     }
     migrateLastActiveAt();
     return metadataCache;
@@ -74,65 +134,81 @@ function migrateLastActiveAt() {
             migrated++;
         }
     }
+    // Mark as done even if nothing was migrated; flush immediately so the migration is durable
+    metadataCache._migrated_lastActiveAt = Date.now();
+    flushScheduler.markReal();
+    flushScheduler.flushNow();
     if (migrated > 0) {
-        metadataCache._migrated_lastActiveAt = Date.now();
-        dirty = true;
-        // Flush immediately so the migration is durable
-        flushSync();
         console.log(`[STC-MOD] Migration: backfilled lastActiveAt for ${migrated} users.`);
-    } else {
-        // Mark as done even if nothing to migrate
-        metadataCache._migrated_lastActiveAt = Date.now();
-        dirty = true;
-        flushSync();
     }
 }
-
 
 /**
  * Atomically persist the current cache to disk.
  * Writes to a temp file and renames over the target so readers never observe a
- * partially written file. Keeps a single `.bak` copy of the previous good file.
+ * partially written file. Called by the flush scheduler only.
+ * @param {boolean} refreshBackup Copy the current file to `.bak` first (flushes with a real change)
+ * @returns {boolean} false when the write failed (the scheduler keeps the changes pending)
  */
-function flushSync() {
-    if (!metadataCache || !dirty) return;
+function writeMetadataFile(refreshBackup) {
+    if (!metadataCache) return true;
     const filePath = getMetadataPath();
     const tmpPath = `${filePath}.${process.pid}.tmp`;
     try {
         const data = JSON.stringify(metadataCache, null, 2);
         fs.writeFileSync(tmpPath, data, 'utf8');
-        // Preserve the previous file as a backup before replacing it.
-        if (fs.existsSync(filePath)) {
+        // Preserve the previous file as a backup before replacing it (real changes only).
+        if (refreshBackup && !skipNextBackup && fs.existsSync(filePath)) {
             try { fs.copyFileSync(filePath, filePath + '.bak'); } catch { /* best-effort */ }
         }
         fs.renameSync(tmpPath, filePath);
-        dirty = false;
+        skipNextBackup = false;
+        return true;
     } catch (e) {
         console.error('[STC-MOD] Failed to save user metadata:', e.message);
         try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+        return false;
     }
 }
 
+const flushScheduler = createFlushScheduler({
+    flush: ({ real }) => writeMetadataFile(real),
+    realDelayMs: FLUSH_DEBOUNCE_MS,
+    activityDelayMs: ACTIVITY_FLUSH_MS,
+    onError: (e) => console.error('[STC-MOD] Failed to save user metadata:', /** @type {Error} */ (e)?.message),
+});
+
 /**
- * Mark the cache dirty and schedule a debounced flush.
- * @param {boolean} [immediate] When true, flush synchronously right away.
+ * Record a change and schedule the matching flush.
+ * @param {boolean} activityOnly Only activity fields (lastActiveAt) changed
+ * @param {boolean} immediate Flush synchronously right away
  */
-function scheduleFlush(immediate = false) {
-    dirty = true;
-    if (immediate) {
-        if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-        flushSync();
-        return;
+function scheduleFlush(activityOnly, immediate) {
+    if (activityOnly) {
+        flushScheduler.markActivity();
+    } else {
+        flushScheduler.markReal();
     }
-    // Always ensure a timer is scheduled when dirty=true. If a timer already
-    // exists, don't replace it (let it run), but if no timer is running, start one.
-    if (!flushTimer) {
-        flushTimer = setTimeout(() => {
-            flushTimer = null;
-            flushSync();
-        }, FLUSH_DEBOUNCE_MS);
-        flushTimer.unref?.();
-    }
+    if (immediate) flushScheduler.flushNow();
+}
+
+/** Flush everything pending (activity included); used by the shutdown hooks. */
+function stcFlushUserMetadataOnExit() {
+    flushScheduler.flushNow();
+}
+
+/**
+ * Signal handling: flush, then exit only when nobody else handles the signal. The official graceful
+ * shutdown (server-main.js `exitProcess`: stats, plugins, disk cache) registers its SIGINT/SIGTERM
+ * listeners after this module is loaded and ends with process.exit(), which runs the 'exit' hook
+ * (flushes again if anything changed meanwhile). Before those listeners exist (early startup, tests)
+ * a registered listener would otherwise disable Node's default exit on the signal.
+ * @param {NodeJS.Signals} signal
+ */
+function flushOnSignal(signal) {
+    stcFlushUserMetadataOnExit();
+    // `once` listeners are removed before they run: anything left is another handler
+    if (process.listenerCount(signal) === 0) process.exit(0);
 }
 
 // Ensure pending changes are persisted on shutdown.
@@ -140,10 +216,9 @@ let exitHooked = false;
 function ensureExitHook() {
     if (exitHooked) return;
     exitHooked = true;
-    const onExit = () => flushSync();
-    process.once('exit', onExit);
-    process.once('SIGINT', () => { flushSync(); process.exit(0); });
-    process.once('SIGTERM', () => { flushSync(); process.exit(0); });
+    process.once('exit', stcFlushUserMetadataOnExit);
+    process.once('SIGINT', function stcFlushUserMetadataOnSigint() { flushOnSignal('SIGINT'); });
+    process.once('SIGTERM', function stcFlushUserMetadataOnSigterm() { flushOnSignal('SIGTERM'); });
 }
 ensureExitHook();
 
@@ -158,7 +233,7 @@ ensureExitHook();
  * @property {number} [expiresAt] - Account expiration timestamp (ms), 0 = permanent
  * @property {number} [createdAt] - Registration timestamp
  * @property {number} [lastLoginAt] - Last login timestamp (set only on actual login)
- * @property {number} [lastActiveAt] - Last activity timestamp (set on login and heartbeat)
+ * @property {number} [lastActiveAt] - Last activity timestamp (set on login and heartbeat; heartbeat-only updates are written at most every 60 s)
  * @property {string} [inviteCodeUsed] - Invite code used for registration
  * @property {boolean} [hasPassword] - Whether user has set a password (for OAuth users)
  * @property {boolean} [passwordAutoGenerated] - Stored password is a random one generated by STC-MOD (unknown to the user)
@@ -201,7 +276,22 @@ export function getUserMeta(handle) {
 }
 
 /**
+ * Whether a patch only touches activity fields (lastActiveAt): such updates are written at most
+ * once per ACTIVITY_FLUSH_MS and never refresh the `.bak` copy.
+ * @param {object} data Patch passed to setUserMeta
+ * @returns {boolean}
+ */
+export function isActivityOnlyPatch(data) {
+    if (!data || typeof data !== 'object') return false;
+    const keys = Object.keys(data);
+    return keys.length > 0 && keys.every(key => ACTIVITY_ONLY_KEYS.has(key));
+}
+
+/**
  * Set extended data for a user (merge with existing).
+ * The change is visible to readers immediately. A patch that only sets `lastActiveAt` is an
+ * activity-only change (flushed within ACTIVITY_FLUSH_MS); anything else is a real change
+ * (flushed within FLUSH_DEBOUNCE_MS).
  * @param {string} handle User handle
  * @param {Partial<UserExtendedData>} data Data to merge
  * @param {object} [opts]
@@ -214,7 +304,7 @@ export function setUserMeta(handle, data, opts = {}) {
         meta[handle] = {};
     }
     Object.assign(meta[handle], data);
-    scheduleFlush(opts.immediate === true);
+    scheduleFlush(isActivityOnlyPatch(data), opts.immediate === true);
 }
 
 /**
@@ -236,7 +326,7 @@ export function unsetUserMetaFields(handle, fields, opts = {}) {
             changed = true;
         }
     }
-    if (changed) scheduleFlush(opts.immediate === true);
+    if (changed) scheduleFlush(false, opts.immediate === true);
     return changed;
 }
 
@@ -248,7 +338,7 @@ export function deleteUserMeta(handle) {
     const meta = loadMetadata();
     if (!meta) return; // Defensive: should never happen
     delete meta[handle];
-    scheduleFlush(true);
+    scheduleFlush(false, true);
 }
 
 /**
@@ -324,16 +414,13 @@ export function recordLogin(handle) {
 
 /**
  * Record a lightweight activity ping (e.g. heartbeat).
- * Updates only lastActiveAt and uses the debounced flush, so frequent pings do
- * not hammer the disk.
+ * Updates only lastActiveAt: an activity-only change, written at most once per
+ * ACTIVITY_FLUSH_MS (together with every other pending change) and without a `.bak` refresh,
+ * so frequent pings from many open tabs do not rewrite the file every few seconds.
  * @param {string} handle
  */
 export function recordActivity(handle) {
-    const now = Date.now();
-    // Use setUserMeta for all updates to ensure consistency.
-    // The internal scheduleFlush(false) will automatically coalesce writes
-    // within the debounce window, so high-frequency heartbeats are batched.
-    setUserMeta(handle, { lastActiveAt: now });
+    setUserMeta(handle, { lastActiveAt: Date.now() });
 }
 
 /**
@@ -405,17 +492,33 @@ export function extendExpiration(handle, durationMs) {
 }
 
 /**
- * Force an immediate synchronous flush of pending changes (for tests/admin ops).
+ * Force an immediate synchronous flush of everything pending, activity included (for tests/admin ops).
+ * @returns {boolean} false when the write failed (the changes stay pending and are retried)
  */
 export function flushMetadata() {
-    flushSync();
+    return flushScheduler.flushNow();
+}
+
+/**
+ * Pending write state (for diagnostics and tests). `dueAt` is monotonic (performance.now() ms).
+ * @returns {{pending: 'none'|'activity'|'real', dueAt: number|null}}
+ */
+export function getMetadataFlushState() {
+    return flushScheduler.getState();
 }
 
 /**
  * Invalidate the in-memory cache (for testing or force-reload).
- * Flushes pending changes first so nothing is lost.
+ * Flushes pending changes first; when that write fails the cache is kept (with the changes still
+ * pending and a retry armed) so nothing is lost.
+ * @returns {boolean} Whether the cache was dropped
  */
 export function invalidateCache() {
-    flushSync();
+    if (!flushScheduler.flushNow()) {
+        console.error('[STC-MOD] User metadata cache kept: pending changes could not be written (retry scheduled).');
+        return false;
+    }
     metadataCache = null;
+    skipNextBackup = false; // decided again by the next load
+    return true;
 }

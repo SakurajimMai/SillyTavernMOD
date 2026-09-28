@@ -9,8 +9,8 @@
  * - configureTrustProxy(app) -> Reverse proxy trust (before cookie-session)
  * - shouldSkipCsrf(req)    -> CSRF exemption check
  * - setupPublicRoutes(app) -> Password-migration gate, QRole password-login gate,
- *                             QRole session guard, page routes incl. the QRole
- *                             export-only page (before official routes and login middleware)
+ *                             QRole session guard, settings.json safeguard, page routes incl.
+ *                             the QRole export-only page (before official routes and login middleware)
  * - setupPublicApi(app)    -> Public API routes (no auth required)
  * - setupPrivateRoutes(app)-> Private API routes (auth required)
  */
@@ -33,6 +33,7 @@ import { isRegistrationEnabled } from './services/registration.js';
 import { runPasswordMigrationOnce } from './services/password-migration.js';
 import { liveMetaForRecord } from './services/account-security.js';
 import { qroleSessionGuard } from './services/qrole-session.js';
+import { ensureUserSettingsFile } from './services/settings-safeguard.js';
 import { clearExportSession, resolveExportSession } from './services/qrole-export.js';
 import { startQroleCleanupScheduler } from './services/qrole-cleanup.js';
 import { isPasswordLoginAllowed } from './routes/private/set-password.js';
@@ -205,6 +206,13 @@ export async function setupPublicRoutes(app) {
     // End sessions of QRole accounts whose membership lapsed or must be re-verified
     // (setUserDataMiddleware already ran, so req.user is set)
     app.use(qroleSessionGuard);
+
+    // Recreate a missing settings.json before the official POST /api/settings/get reads it
+    // (account reset with `skipContentCheck: true` leaves the user without one -> HTTP 500).
+    // Mounted like the official settings router so every path variant it accepts is covered.
+    const settingsGuard = express.Router();
+    settingsGuard.post('/get', ensureUserSettingsFile);
+    app.use('/api/settings', settingsGuard);
 
     // Serve custom login page (overrides official /login)
     // Pages are rendered with the config.yaml `site` settings (falls back to the static file)

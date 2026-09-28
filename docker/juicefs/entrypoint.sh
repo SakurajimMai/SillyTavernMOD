@@ -47,13 +47,15 @@ if ! STATUS_OUTPUT="$(juicefs status "$META_URL" 2>&1)"; then
         exit 1
     fi
 else
-    # Keep the stored credentials in sync with s3.env. Metadata backups do not contain the
-    # secret key, so this is required after `juicefs load`; it also applies key rotations.
+    # Keep the stored settings in sync with s3.env (format only runs once). Metadata backups
+    # do not contain the secret key, so this is required after `juicefs load`; it also applies
+    # key rotations and changes of JFS_TRASH_DAYS.
     if ! CONFIG_OUTPUT="$(juicefs config "$META_URL" \
         --access-key "$JFS_ACCESS_KEY" \
         --secret-key "$JFS_SECRET_KEY" \
+        --trash-days "${JFS_TRASH_DAYS:-7}" \
         --yes 2>&1)"; then
-        echo "[juicefs] Failed to apply S3 credentials from s3.env:" >&2
+        echo "[juicefs] Failed to apply settings from s3.env:" >&2
         echo "$CONFIG_OUTPUT" >&2
         sleep 10
         exit 1

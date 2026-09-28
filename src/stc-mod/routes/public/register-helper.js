@@ -7,7 +7,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import storage from 'node-persist';
 import lodash from 'lodash';
-import { checkForNewContent, CONTENT_TYPES } from '../../../endpoints/content-manager.js';
 import {
     toKey,
     getAllUserHandles,
@@ -20,6 +19,7 @@ import { deleteUserMeta, findUserByOAuth, getUserMeta, setUserMeta } from '../..
 import { applyRandomPassword, OAUTH_PROVIDERS } from '../../services/account-security.js';
 import { getDefaultLimitMiB, isStorageLimitEnabled } from '../../services/storage-quota.js';
 import { applyTemplate, getTemplateMeta } from '../../services/default-template.js';
+import { seedNewUserContent } from '../../services/user-content-seed.js';
 
 /** Handles that self-registration (local or OAuth) may never claim. */
 export const WEAK_NAMES = Object.freeze(['admin', 'root', 'system', 'test', 'null', 'undefined', 'default', 'default-user']);
@@ -83,14 +83,16 @@ function dropStaleMeta(handle) {
 }
 
 /**
- * Create the per-user data directories, like the official /api/users/create endpoint.
+ * Create the per-user data directories and seed the default content, like the official
+ * /api/users/create endpoint (config.yaml `newUserContent: minimal` seeds only settings.json and
+ * the default persona avatar, see services/user-content-seed.js).
  * @param {string} handle
  */
 async function ensureUserDirectories(handle) {
     console.info('[STC-MOD] Creating data directories for', handle);
     await ensurePublicDirectoriesExist();
     const directories = getUserDirectories(handle);
-    await checkForNewContent([directories], [CONTENT_TYPES.SETTINGS]);
+    await seedNewUserContent(directories);
 }
 
 /**
