@@ -298,10 +298,11 @@ Go to: http://127.0.0.1:8000/ to open SillyTavern
 | 邀请码 | 「注册设置」（开放注册开关）、续费购买链接、创建与管理邀请码（邀请码功能需在 `config.yaml` 中设 `enableInvitationCodes: true`） |
 | 公告管理 | 创建、启用 / 禁用、删除公告 |
 | 邮件配置 | SMTP 服务器与发件人设置，发送测试邮件 |
-| OAuth 配置 | GitHub / Discord / Linux.do / QRole 的 Client ID、Client Secret、回调地址等 |
+| OAuth 配置 | GitHub / Discord / Linux.do / QRole 的 Client ID、Client Secret、回调地址等；QRole 的「会员到期处理」（后台自动复核、续费链接、到期提醒天数、过期后导出数据） |
 | 默认模板 | 从现有用户生成新用户的默认配置模板 |
 | 用户空间 | 存储配额（默认上限、每日签到奖励）与空间扩容激活码 |
 | 用户管理 | 用户存储占用分析、多选与批量删除、清理长期未登录用户 |
+| QRole 会员 | QRole 账号的会员状态、到期时间、刷新令牌与计划清理时间；立即复核、单个 / 批量删除；过期账号自动清理设置、预览与立即执行（见 [会员到期后的处理](#会员到期后的处理)） |
 | 定时任务 | 立即清理备份文件、自动定时清理配置 |
 
 设置密码、授予管理员权限在官方「用户设置」→「管理员面板」→「管理用户」中完成，手动创建账号在同一面板的「新用户」中完成，都不在 STC 管理面板中。
@@ -380,10 +381,10 @@ docker compose -f docker-compose.s3.yml up -d --build
 |----------|----------------|
 | A | `~/sillytavern/` 下的 `config/`、`data/`，以及自行放入的 `plugins/`、`extensions/` |
 | B | `SillyTavernMOD/docker/` 下的 `config/`、`data/`，以及 `plugins/`、`extensions/` |
-| C | 项目根目录的 `config.yaml`、`data/`，以及 `plugins/`、`public/scripts/extensions/third-party/` 中自行安装的扩展 |
+| C | 项目根目录的 `config.yaml`、`stc-mod-token.key`（使用 QRole 后台自动复核时生成）、`data/`，以及 `plugins/`、`public/scripts/extensions/third-party/` 中自行安装的扩展 |
 | D（S3 / JuiceFS） | 存储桶 + 元数据库（云 MariaDB / MySQL 用其自带备份；本地 Redis 则备份 `docker/juicefs/redis/`）、`docker/s3.env`、`docker/config/`，以及 `docker/plugins/`、`docker/extensions/`。JuiceFS 每小时还会自动把元数据备份到桶内 `<JFS_NAME>/meta/`，见 [元数据库丢失时的恢复](#5-元数据库丢失时的恢复) |
 
-`data/` 中包含全部账号、聊天、角色卡和 STC-MOD 数据，建议先停止服务再复制。以方式 A 为例：
+`data/` 中包含全部账号、聊天、角色卡和 STC-MOD 数据，建议先停止服务再复制。`config/`（方式 C 为项目根目录）中的 `stc-mod-token.key` 是 QRole 刷新令牌的加密密钥，务必与配置一起备份（丢失只会让 QRole 用户重新登录一次，见 [会员到期后的处理](#会员到期后的处理)）。以方式 A 为例：
 
 ```bash
 docker stop sillytavernmod
@@ -482,7 +483,7 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
    - 关联了已停用登录方式的**管理员**账号不会被加固（日志会给出警告），请尽快为其手动设置密码。
 3. **没有密码的账号不能再仅凭用户名登录**（`default-user` 除外），例如早期注册时未填密码的用户。第一个请求之后，日志会列出这些账号：`[STC-MOD] 以下账号没有密码，已禁止仅凭用户名登录，请在用户管理中为其设置密码：...`。处理方法见 [常见问题](#7-常见问题)。
 4. **注册规则收紧**：本地注册必须设置 8–128 位密码；注册、发送验证码和第三方补全注册接口都需要 CSRF 令牌（自行编写脚本调用这些接口时，需先请求 `/csrf-token`，再在请求头中带上 `X-CSRF-Token`）；第三方登录的状态和待补全身份保存在服务端会话中，无法再伪造。
-5. **新配置项自动写入**：启动时自动补上 `enableRegistration`（默认 `true`）、`oauth.qrole`、`site`、`deployment.trustProxy`（默认 `false`）等缺失的配置项，已有的值不会被修改；重写后文件中的注释会消失。唯一的例外：`oauth.qrole.scope` 仍是旧默认值 `openid profile email` 且开启了「仅允许会员登录」时，会自动改为 `openid profile email membership`（日志 `[STC-MOD] oauth.qrole.scope upgraded to ...`），否则 QRole 不返回会员信息、所有 QRole 登录都会被拒绝；自定义过的 Scope 不会被改动，请自行加上 `membership`。
+5. **新配置项自动写入**：启动时自动补上 `enableRegistration`（默认 `true`）、`oauth.qrole`、`site`、`deployment.trustProxy`（默认 `false`）等缺失的配置项，已有的值不会被修改；重写后文件中的注释会消失。唯一的例外：`oauth.qrole.scope` 仍是旧默认值 `openid profile email` 且开启了「仅允许会员登录」时，会自动改为 `openid profile email membership`（日志 `[STC-MOD] oauth.qrole.scope upgraded to ...`），否则 QRole 不返回会员信息、所有 QRole 登录都会被拒绝；自定义过的 Scope 不会被改动，请自行加上 `membership`。QRole「会员到期处理」的新配置项（`oauth.qrole.backgroundReverify`、`renewUrl`、`expiryReminderDays`、`expiredDataExport`、`expiredCleanup`）由官方启动流程按 `default/config.yaml` 补上，取值与代码默认值相同，其中自动清理默认关闭。
 6. **`config.yaml` 改为原子写入**：STC-MOD 保存配置时先写临时文件再替换（保留 Docker 中的符号链接）；文件有语法错误时拒绝写入，运行中的服务继续使用最后一次正确的设置。拒绝写入时，「注册设置」「OAuth 配置」会提示保存失败；「邮件配置」「用户空间」「定时任务」和购买链接仍会显示保存成功，但实际没有写入。此时不要重启：带语法错误的 `config.yaml` 会让服务启动失败（`FATAL: Failed to read config.yaml...`，Docker 容器会不断重启），先修正语法再重启。
 7. **反代信任改为手动配置**：旧版的自动探测已移除，经反向代理用 HTTPS 部署时需在 `config.yaml` 中设置 `deployment.trustProxy`（见 [反向代理部署](#反向代理部署nginx--openresty--cloudflare)）。
 8. **Docker 用户要手动更新 STC 管理面板**：容器不会覆盖挂载目录中已有的 `stc-admin-panel`，更新镜像后请先删除宿主机上的 `extensions/stc-admin-panel` 再启动容器（见 [更新](#更新)）。
@@ -596,13 +597,15 @@ docker compose -f docker-compose.s3.yml restart juicefs sillytavern
 
 只有 **QRole VIP / SVIP 会员**可以用「QRole 会员登录」按钮直接进入本站；首次登录自动开户（即使已关闭注册、即使开启了邀请码），之后每次登录都会重新校验会员身份。
 
+自动开户的账号名（handle）取 QRole **用户名**（QRole 内唯一、注册后不可修改），例如 `sakura`；用户名是保留名（`admin`、`root`、`test` 等）或已被本站其他账号占用时依次改用 `qrole-<用户名>`（如 `qrole-admin`）、`qrole-<QRole 用户 ID>`。账号名只在创建时确定，之后不会变化；账号始终按 QRole 用户 ID 绑定，与账号名无关。显示名取 QRole 昵称。
+
 **QRole OAuth 对接约定**（QRole 已按下表提供，无需再向 QRole 确认字段格式）：
 
 | 项目 | 约定 |
 |------|------|
 | 端点 | 授权 `https://www.qqy.one/api/oauth/authorize`、令牌 `https://www.qqy.one/api/oauth/token`、用户信息 `https://www.qqy.one/api/oauth/userinfo`；发现文档 `https://www.qqy.one/api/oauth/.well-known` |
 | 授权范围（scope） | 默认 `openid profile email membership`。`membership` 让 userinfo 返回会员信息，授权页显示为「查看会员状态」；缺少它时 userinfo 中没有会员字段，开启「仅允许会员登录」后**所有人都会被拒绝登录** |
-| 会员字段（需 `membership`） | `membership_tier`：当前**有效**等级，小写（`free` / `vip` / `svip`，或 QRole 配置的其他等级 id）；付费会员过期后 QRole 直接返回 `free`<br>`membership_expires_at`：付费会员到期时间，ISO-8601 UTC 字符串（如 `2026-12-31T16:00:00.000Z`）；仅 `free` 为 `null`（QRole 没有永久会员，付费等级总是带到期时间）<br>`membership_tier_name`：等级显示名，可能为 `null`（本站不使用） |
+| 会员字段（需 `membership`） | `membership_tier`：当前**有效**等级，小写（`free` / `vip` / `svip`，或 QRole 配置的其他等级 id）；付费会员过期后 QRole 直接返回 `free`<br>`membership_expires_at`：付费会员到期时间，ISO-8601 UTC 字符串（如 `2026-12-31T16:00:00.000Z`）；仅 `free` 为 `null`（QRole 没有永久会员，付费等级总是带到期时间）<br>`membership_tier_name`：等级显示名，可能为 `null`（本站仅用于到期提醒、数据导出页与管理面板的显示） |
 | 其他字段 | `sub`（QRole 用户 id，用作账号绑定标识）；`name`、`preferred_username`、`picture`（`profile`）；`email`、`email_verified`（`email`）。QRole 的角色（`qrole_role`）本站不请求也不使用 |
 | PKCE | 支持 RFC 7636 **S256**（不支持 `plain`）；本站默认开启（`usePkce: true`），每次登录生成新的 `code_verifier` |
 | 客户端认证 | 令牌端点支持 `client_secret_post`（默认）或 `client_secret_basic`；只支持带 Client Secret 的机密客户端 |
@@ -626,11 +629,53 @@ docker compose -f docker-compose.s3.yml restart juicefs sillytavern
 
 **会员校验规则**：
 
-- 每次 QRole 登录都会检查：会员等级在允许列表内、未过期、userinfo 若带有 `status` 字段则必须为 active；否则拒绝并在登录页给出原因。QRole 会把已过期的付费会员直接报告为 `free`，因此会员过期的用户登录时看到的是「仅 QRole VIP / SVIP 会员可以登录」。被 QRole 封禁或停用的账号，QRole 会拒绝返回其用户信息，同样无法登录本站。
-- 已登录的会话也会持续校验：已知到期时间一到、管理员从允许列表移除该等级时立即下线；另外每隔「会员状态复核间隔」（默认 24 小时，`oauth.qrole.reverifyHours`）需要重新用 QRole 登录一次以确认会员仍有效（页面刷新时按 24 小时，聊天等 API 请求有 48 小时宽限，避免对话中途被踢出）。设为 0 则只按已知到期时间和等级判断。
+- 每次 QRole 登录都会检查：会员等级在允许列表内、未过期、userinfo 若带有 `status` 字段则必须为 active；否则拒绝并在登录页给出原因。QRole 会把已过期的付费会员直接报告为 `free`：本站已有账号的用户进入数据导出页面，并按本站记录的到期时间显示「QRole 会员已过期」（见 [会员到期后的处理](#会员到期后的处理)）；没有本站账号或关闭了数据导出时，登录页提示「仅 QRole VIP / SVIP 会员可以登录」。被 QRole 封禁或停用的账号，QRole 会拒绝返回其用户信息，同样无法登录本站。
+- 已登录的会话也会持续校验：已知到期时间一到、管理员从允许列表移除该等级时立即下线；另外每隔「会员状态复核间隔」（默认 24 小时，`oauth.qrole.reverifyHours`）需要重新用 QRole 登录一次以确认会员仍有效（页面刷新时按 24 小时，聊天等 API 请求有 48 小时宽限，避免对话中途被踢出）。设为 0 则只按已知到期时间和等级判断。开启后台自动复核（默认）时，到期或到达复核间隔的会话会先由服务器自动向 QRole 确认，已续费的用户无需重新登录。
 - 为防止绕过会员校验，QRole 账号**不能用密码登录**；可以在「密码安全」中设置密码，但仅用于重置数据等确认操作。
 - QRole 的管理员角色不会映射成本站管理员。
 - 取消「仅允许会员登录」后，任何 QRole 用户都可登录，但此时 QRole 新用户与其他第三方登录一样受「开放注册」与邀请码约束。
+
+### 会员到期后的处理
+
+QRole 会员到期后，本站账号及其数据**默认一直保留**（除非管理员开启下文的自动清理），续费后重新使用 QRole 登录即回到原账号。以下功能都只在开启「仅允许会员登录」（`requireMembership`）时生效：
+
+1. **到期提醒**：到期前 `expiryReminderDays` 天（默认 7 天）起，QRole 用户页面顶部显示提醒「您的 QRole VIP 会员将于 … 到期」，带「去续费」（`renewUrl`，默认 `https://www.qqy.one/membership`）和「我已续费，刷新状态」按钮；点 × 后 24 小时内不再显示。
+2. **后台自动复核（续费后无需重新登录）**：`backgroundReverify` 开启（默认）时，服务器在每次 QRole 登录时加密保存 QRole 返回的刷新令牌（30 天有效，到期不顺延，下次登录时更新）。会员到期、或到达「会员状态复核间隔」时，服务器先用该令牌向 QRole 查询最新状态：
+   - 已续费：会话照常继续，用户无感知；
+   - QRole 确认已过期或不是会员：会话结束，跳转登录页；
+   - QRole 暂时无法访问：仅「到达复核间隔」的会话最多再宽限一个间隔，已过期的会话不宽限；
+   - QRole 刚确认过已过期或不是会员（5 分钟内）：旧会话直接结束，不再重复向 QRole 查询；
+   - 令牌超过 30 天、被 QRole 撤销，或关闭了该功能：与以前一样，需要重新使用 QRole 登录。
+   - QRole 拒绝本站的客户端凭据（`invalid_client`，例如在 QRole 后台更换了 Client Secret 但未同步到 `config.yaml`）按「QRole 暂时无法访问」处理：令牌保留，服务器日志给出一次提示（`rejected this site's client credentials`），修正配置后自动恢复。
+
+   刷新令牌比会员先到期时（上次 QRole 登录已接近 30 天），提醒中会提示「续费后请重新使用 QRole 登录」。
+
+   用户点击「我已续费，刷新状态」时立即复核一次（每个账号每分钟最多一次）。
+3. **仅可导出数据的页面**：`expiredDataExport` 开启（默认）时，会员已过期或不是会员的**已有账号**使用 QRole 登录后不会进入系统，而是进入 `/qrole-expired` 页面：显示会员等级与到期时间，可「去续费」「续费后重新登录」「下载我的数据（ZIP）」「退出」。
+   - 下载内容与官方「备份全部数据」相同（与官方一样不含 API 密钥文件，除非开启了官方 `allowKeysExposure`），需要官方 `backups.allowFullDataBackup` 为 `true`（默认）；每个账号同一时间只能有一个下载，每小时最多 3 次。
+   - 该页面在 QRole 登录后 30 分钟内有效，期间只能查看状态、下载数据和退出，不能访问其他任何功能；账号被停用、改绑或修改密码后立即失效。
+   - 没有本站账号的非会员，仍只在登录页看到拒绝原因。
+4. **管理员查看**：STC 管理面板「QRole 会员」标签列出全部 QRole 账号（不含管理员），可按 全部 / 已过期 / 7 天内到期 / 有效 筛选，显示等级、状态、到期时间、已过期天数、最后活跃、占用空间、刷新令牌及其到期时间、计划清理时间；可「立即复核」（用刷新令牌向 QRole 确认）、删除单个账号或批量删除（与「用户管理」中的删除相同，不可恢复）。
+5. **自动清理（可选，默认关闭）**：在「QRole 会员」标签勾选「启用自动清理」、设置保留天数（`expiredCleanup.afterDays`，30–3650，默认 90）并保存后生效。
+   - 计划清理时间 = 会员到期时间（非会员为最近一次被拒绝登录的时间；从未尝试登录、由后台复核发现不是会员的，为首次发现的时间）、最后活跃、最后登录三者中最晚者 + 保留天数；数据导出页面会显示该日期。
+   - 服务器每小时检查一次，每 24 小时最多执行一次，每次最多删除 20 个账号（账号、数据目录与 STC 元数据）；也可点击「立即执行清理」（在后台运行，管理面板自动等待并显示结果，不受反向代理超时影响）。
+   - 删除前，持有刷新令牌的账号先向 QRole 复核：已续费的保留，QRole 无法访问或拒绝本站客户端凭据时顺延到下次。
+   - 真正删除前的最后一刻（持有该账号的删除锁时）会重新读取配置与账号并再次判断：期间续费登录、被设为管理员、改绑或有新活动的账号不会被删除；清理开关或「仅允许会员登录」在运行中被关闭时任务立即停止。同一账号的 QRole 登录会等待正在进行的删除结束。
+   - 建议先点击「预览将被清理的账号」确认名单。每次删除都会写入服务器日志和 `data/stc-mod/qrole-cleanup-log.json`（保留最近 200 条），上次运行结果见 `data/stc-mod/qrole-cleanup-state.json` 与管理面板。
+   - S3 / JuiceFS 部署中，被删除的文件会先进入 JuiceFS 回收站（默认 7 天，见 [注意事项](#注意事项)），期间运维人员可以找回；本站不依赖回收站，请把删除视为不可恢复。
+
+**刷新令牌密钥文件 `stc-mod-token.key`**：刷新令牌用 AES-256-GCM 加密后保存在 `data/stc-mod/user-metadata.json` 中，任何接口都不会返回令牌；密钥是与 `config.yaml` 同目录的 `stc-mod-token.key`（Docker 部署为 `config/stc-mod-token.key`，直接运行时在项目根目录，不要提交到 Git），首次使用时自动生成，权限 0600。密钥故意不放在数据目录（数据目录可能位于远程对象存储），**请与 `config/` 一起备份**。密钥丢失后会生成新密钥，旧令牌无法解密而被删除，影响仅是 QRole 用户到期或到达复核间隔时需要重新登录一次；密钥文件无法创建或读取时，后台复核自动停用（服务器日志 `[STC-MOD] QRole refresh tokens are disabled: ...`），登录不受影响。
+
+**配置项**（`config.yaml` → `oauth.qrole`；前四项在 STC 管理面板「OAuth 配置」→ QRole →「会员到期处理」中修改，自动清理在「QRole 会员」标签中修改）：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `backgroundReverify` | `true` | 保存 QRole 刷新令牌并在后台复核会员；关闭后已保存的令牌在用户下次登录时删除 |
+| `renewUrl` | `https://www.qqy.one/membership` | 「去续费」按钮的链接，仅支持 http(s)，无效时使用默认值 |
+| `expiryReminderDays` | `7` | 到期前多少天显示续费提醒，0–60，0 = 不提醒 |
+| `expiredDataExport` | `true` | 会员过期 / 非会员的已有账号使用 QRole 登录后进入仅可导出数据的页面 |
+| `expiredCleanup.enabled` | `false` | 自动清理过期 QRole 账号 |
+| `expiredCleanup.afterDays` | `90` | 清理前的保留天数，30–3650 |
 
 ### 关闭注册
 

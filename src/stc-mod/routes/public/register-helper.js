@@ -151,17 +151,22 @@ export async function createUser(handle, name, password = '') {
 }
 
 /**
- * Candidate handles for an OAuth identity, in order of preference.
+ * Candidate handles for an OAuth identity, in order of preference: the provider username
+ * (e.g. `alice`), then the provider-prefixed username when that is reserved or taken
+ * (e.g. `qrole-admin`), then the provider-prefixed user id.
  * @param {string} provider
  * @param {string} id Provider user id
  * @param {string} username Provider username
  * @returns {string[]}
  */
-function getOAuthHandleCandidates(provider, id, username) {
+export function getOAuthHandleCandidates(provider, id, username) {
     const candidates = [];
     const fromName = clampHandle(slugify(username));
     if (fromName.length >= 2 && !WEAK_NAMES.includes(fromName)) {
         candidates.push(fromName);
+    }
+    if (fromName) {
+        candidates.push(clampHandle(`${provider}-${fromName}`));
     }
     const idSlug = slugify(id);
     candidates.push(clampHandle(idSlug ? `${provider}-${idSlug}` : `${provider}-user`));

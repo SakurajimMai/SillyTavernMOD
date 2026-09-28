@@ -12,25 +12,38 @@ import crypto from 'node:crypto';
 import storage from 'node-persist';
 import { getStcConfig } from '../../config.js';
 import { toKey, getAccountVersion } from '../../../users.js';
-import { findUserByOAuth, getUserMeta, setUserMeta, recordLogin } from '../../user-metadata.js';
+import { findUserByOAuth, flushMetadata, getUserMeta, setUserMeta, recordLogin } from '../../user-metadata.js';
 import { createOAuthUser, rollbackCreatedUser } from './register-helper.js';
 import * as invitationService from '../../services/invitation-codes.js';
 import { isRegistrationEnabled, sendRegistrationClosed } from '../../services/registration.js';
 import { OAUTH_PROVIDERS, isMetaForRecord } from '../../services/account-security.js';
 import { evaluateQroleMembership, describeClaimKeys } from '../../services/qrole-membership.js';
+import {
+    PROVIDER_DEFAULTS,
+    buildQroleTokenRequest,
+    configString,
+    getEndpoint,
+    getQroleTierName,
+    normalizeIdentity,
+    parseQroleIdentity,
+    pickClaim,
+    requestJson,
+} from '../../services/oauth-client.js';
+import {
+    buildMembershipSnapshot,
+    getQroleAccountState,
+    getQroleLifecycleConfig,
+    stateToReason,
+} from '../../services/qrole-lifecycle.js';
+import { syncQroleRefreshToken } from '../../services/qrole-reverify.js';
+import { startExportSession } from '../../services/qrole-export.js';
+import { isUserDeletionInProgress, waitForUserDeletion } from '../../services/user-deletion.js';
 
 export const router = express.Router();
 
 // Lifetime of an authorize request (state/PKCE) and of a pending invite-code registration
 const FLOW_TTL_MS = 10 * 60 * 1000;
-// Timeout for every request to the OAuth provider
-const FETCH_TIMEOUT_MS = 15 * 1000;
 const MAX_LINK_CLEANUPS = 10;
-
-const MAX_ID_LENGTH = 256;
-const MAX_NAME_LENGTH = 128;
-const MAX_EMAIL_LENGTH = 254;
-const MAX_AVATAR_LENGTH = 512;
 
 const PENDING_EXPIRED_MESSAGE = '登录状态已失效，请重新使用第三方账号登录';
 const ALREADY_LINKED_MESSAGE = '该第三方账号已绑定其他账户';
@@ -50,37 +63,9 @@ const OAUTH_ERROR_CODES = new Set([
     'registration_closed',
     'create_failed',
     'provider_error',
+    'export_expired',
     'server_error',
 ]);
-
-/** Built-in endpoints. Only linuxdo and qrole may override the URLs from config. */
-const PROVIDER_DEFAULTS = {
-    github: {
-        authUrl: 'https://github.com/login/oauth/authorize',
-        tokenUrl: 'https://github.com/login/oauth/access_token',
-        userInfoUrl: 'https://api.github.com/user',
-        scope: 'read:user user:email',
-    },
-    discord: {
-        authUrl: 'https://discord.com/api/oauth2/authorize',
-        tokenUrl: 'https://discord.com/api/oauth2/token',
-        userInfoUrl: 'https://discord.com/api/users/@me',
-        scope: 'identify email',
-    },
-    linuxdo: {
-        authUrl: 'https://connect.linux.do/oauth2/authorize',
-        tokenUrl: 'https://connect.linux.do/oauth2/token',
-        userInfoUrl: 'https://connect.linux.do/api/user',
-        scope: '',
-    },
-    qrole: {
-        authUrl: 'https://www.qqy.one/api/oauth/authorize',
-        tokenUrl: 'https://www.qqy.one/api/oauth/token',
-        userInfoUrl: 'https://www.qqy.one/api/oauth/userinfo',
-        // `membership` makes QRole's userinfo return membership_tier / membership_expires_at
-        scope: 'openid profile email membership',
-    },
-};
 
 /**
  * Redirect to the login page with a fixed error code (never free text).
@@ -90,17 +75,6 @@ const PROVIDER_DEFAULTS = {
 function redirectOauthError(res, code) {
     const safeCode = OAUTH_ERROR_CODES.has(code) ? code : 'server_error';
     return res.redirect('/login?oauth_error=' + encodeURIComponent(safeCode));
-}
-
-/**
- * Read a config value as a trimmed string (YAML may turn numeric client ids into numbers).
- * @param {*} value
- * @returns {string}
- */
-function configString(value) {
-    if (typeof value === 'string') return value.trim();
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-    return '';
 }
 
 /**
@@ -114,21 +88,6 @@ function getEnabledProviderConfig(provider) {
     if (!config || typeof config !== 'object' || !config.enabled) return null;
     if (!configString(config.clientId)) return null;
     return config;
-}
-
-/**
- * Provider endpoint URL (authUrl / tokenUrl / userInfoUrl).
- * @param {string} provider
- * @param {object} config
- * @param {'authUrl'|'tokenUrl'|'userInfoUrl'} key
- * @returns {string}
- */
-function getEndpoint(provider, config, key) {
-    if (provider === 'linuxdo' || provider === 'qrole') {
-        const configured = configString(config[key]);
-        if (configured) return configured;
-    }
-    return PROVIDER_DEFAULTS[provider][key];
 }
 
 /**
@@ -265,67 +224,20 @@ function membershipMeta(membership) {
 }
 
 /**
- * Describe a fetch failure without echoing anything that could contain secrets.
- * @param {*} error
- * @returns {string}
+ * @typedef {Object} TokenExchangeResult
+ * @property {string} accessToken
+ * @property {string|null} refreshToken QRole only (null for other providers or when none was issued)
+ * @property {*} refreshTokenExpiresIn QRole `refresh_token_expires_in` (seconds), if reported
  */
-function describeFetchError(error) {
-    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return 'timeout';
-    return String(error?.cause?.code || error?.name || 'network error');
-}
 
 /**
- * Request JSON from the provider. Never throws; failures are logged (status only) and yield null.
- * @param {string} url
- * @param {RequestInit} init
- * @param {string} label Log label, e.g. 'github token'
- * @returns {Promise<object|null>}
- */
-async function requestJson(url, init, label) {
-    let parsedUrl;
-    try {
-        parsedUrl = new URL(url);
-    } catch {
-        console.warn(`[STC-MOD] OAuth ${label} URL is invalid`);
-        return null;
-    }
-    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
-        console.warn(`[STC-MOD] OAuth ${label} URL must be http(s)`);
-        return null;
-    }
-
-    let resp;
-    try {
-        resp = await fetch(parsedUrl, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    } catch (error) {
-        console.warn(`[STC-MOD] OAuth ${label} request failed: ${describeFetchError(error)}`);
-        return null;
-    }
-
-    if (!resp.ok) {
-        console.warn(`[STC-MOD] OAuth ${label} request failed: HTTP ${resp.status}`);
-        await resp.body?.cancel().catch(() => {});
-        return null;
-    }
-
-    try {
-        const data = await resp.json();
-        if (data && typeof data === 'object' && !Array.isArray(data)) return data;
-    } catch {
-        // Parse errors may quote the body (tokens); do not log them
-    }
-    console.warn(`[STC-MOD] OAuth ${label} response is not a JSON object`);
-    return null;
-}
-
-/**
- * Exchange the authorization code for an access token.
+ * Exchange the authorization code for an access token (and, for QRole, the refresh token).
  * @param {string} provider
  * @param {object} config
  * @param {string} code
  * @param {string} callbackUrl
  * @param {string|null} verifier PKCE code verifier
- * @returns {Promise<string|null>} Access token, or null on failure
+ * @returns {Promise<TokenExchangeResult|null>} Tokens, or null on failure
  */
 async function exchangeCode(provider, config, code, callbackUrl, verifier) {
     const clientId = configString(config.clientId);
@@ -344,17 +256,10 @@ async function exchangeCode(provider, config, code, callbackUrl, verifier) {
             body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret, code, grant_type: 'authorization_code', redirect_uri: callbackUrl }).toString();
             break;
         case 'qrole': {
-            headers = { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' };
-            const params = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: callbackUrl });
-            if (config.tokenAuthMethod === 'client_secret_basic') {
-                const credentials = `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`;
-                headers['Authorization'] = `Basic ${Buffer.from(credentials, 'utf8').toString('base64')}`;
-            } else {
-                params.set('client_id', clientId);
-                if (clientSecret) params.set('client_secret', clientSecret);
-            }
-            if (verifier) params.set('code_verifier', verifier);
-            body = params.toString();
+            /** @type {Record<string, string>} */
+            const fields = { grant_type: 'authorization_code', code, redirect_uri: callbackUrl };
+            if (verifier) fields.code_verifier = verifier;
+            ({ headers, body } = buildQroleTokenRequest(config, fields));
             break;
         }
         default:
@@ -367,70 +272,14 @@ async function exchangeCode(provider, config, code, callbackUrl, verifier) {
         console.warn(`[STC-MOD] OAuth ${provider} token response has no access_token`);
         return null;
     }
-    return data.access_token;
-}
-
-/**
- * First value that is a non-empty string or a finite number.
- * @param {...*} values
- * @returns {string|number|undefined}
- */
-function pickClaim(...values) {
-    return values.find(value => (typeof value === 'string' && value.trim() !== '') || (typeof value === 'number' && Number.isFinite(value)));
-}
-
-/**
- * Printable, trimmed, length-limited text, or null.
- * @param {*} value
- * @param {number} maxLength
- * @returns {string|null}
- */
-function cleanText(value, maxLength) {
-    if (typeof value !== 'string' && typeof value !== 'number') return null;
-    const text = String(value).replace(/\p{Cc}/gu, '').trim();
-    return text ? text.slice(0, maxLength) : null;
-}
-
-/**
- * @param {*} value
- * @returns {string|null}
- */
-function cleanEmail(value) {
-    if (typeof value !== 'string') return null;
-    const email = value.trim();
-    if (!email || email.length > MAX_EMAIL_LENGTH || /\s/.test(email) || !email.includes('@')) return null;
-    return email;
-}
-
-/**
- * Only http(s) avatar URLs are kept.
- * @param {*} value
- * @returns {string|null}
- */
-function cleanAvatar(value) {
-    if (typeof value !== 'string' || !value.trim() || value.length > MAX_AVATAR_LENGTH) return null;
-    try {
-        const url = new URL(value.trim());
-        return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Normalize a provider identity. Returns null when there is no usable user id.
- * @param {{id: *, username: *, displayName: *, email: *, avatar: *}} raw
- * @returns {{id: string, username: string|null, displayName: string|null, email: string|null, avatar: string|null}|null}
- */
-function normalizeIdentity({ id, username, displayName, email, avatar }) {
-    const idStr = cleanText(id, MAX_ID_LENGTH + 1);
-    if (!idStr || idStr.length > MAX_ID_LENGTH) return null;
+    // Only QRole refresh tokens are used (background membership re-verification)
+    const refreshToken = provider === 'qrole' && typeof data.refresh_token === 'string' && data.refresh_token
+        ? data.refresh_token
+        : null;
     return {
-        id: idStr,
-        username: cleanText(username, MAX_NAME_LENGTH),
-        displayName: cleanText(displayName, MAX_NAME_LENGTH),
-        email: cleanEmail(email),
-        avatar: cleanAvatar(avatar),
+        accessToken: data.access_token,
+        refreshToken,
+        refreshTokenExpiresIn: refreshToken ? data.refresh_token_expires_in : undefined,
     };
 }
 
@@ -475,14 +324,7 @@ async function fetchIdentity(provider, config, token) {
         case 'qrole': {
             const data = await requestJson(getEndpoint(provider, config, 'userInfoUrl'), { headers: bearerHeaders }, 'qrole userinfo');
             if (!data) return null;
-            const username = pickClaim(data.preferred_username, data.username, data.login, data.name);
-            const identity = normalizeIdentity({
-                id: pickClaim(data.sub, data.id, data.user_id, data.userId),
-                username,
-                displayName: pickClaim(data.name, data.displayName, data.nickname, username),
-                email: data.email,
-                avatar: pickClaim(data.picture, data.avatar, data.avatar_url),
-            });
+            const identity = parseQroleIdentity(data);
             // Raw claims are needed for the membership check; the QRole `role` claim is never used
             return identity ? { ...identity, claims: data } : null;
         }
@@ -493,7 +335,10 @@ async function fetchIdentity(provider, config, token) {
 
 /**
  * Find the live account linked to an OAuth identity. Links pointing at deleted accounts (or at a
- * different account that re-used the handle) are cleared on the way.
+ * different account that re-used the handle) are cleared on the way. An account that is being
+ * deleted (admin deletion or the QRole cleanup job) is never resumed: the lookup waits for the
+ * deletion to finish and starts over, so a login racing a deletion either keeps the account (the
+ * deletion was cancelled by its final check) or finds no account.
  * @param {string} provider
  * @param {string} id
  * @returns {Promise<{handle: string, record: object}|null>}
@@ -503,7 +348,16 @@ async function resolveLinkedAccount(provider, id) {
         const handle = findUserByOAuth(provider, id);
         if (!handle) return null;
 
+        if (isUserDeletionInProgress(handle)) {
+            await waitForUserDeletion(handle);
+            continue;
+        }
         const record = await storage.getItem(toKey(handle));
+        if (isUserDeletionInProgress(handle)) {
+            // The deletion started while the record was being read
+            await waitForUserDeletion(handle);
+            continue;
+        }
         if (record && isMetaForRecord(getUserMeta(handle), record)) {
             return { handle, record };
         }
@@ -516,23 +370,62 @@ async function resolveLinkedAccount(provider, id) {
 
 /**
  * Log the user in (same session fields as the official login) and record the login.
+ * For QRole accounts the membership snapshot is stored and the refresh token rules applied
+ * (stored encrypted while background re-verification is on, removed otherwise).
  * @param {import('express').Request} req
  * @param {string} handle
  * @param {object} userRecord Official user record
- * @param {{tier: string|null, expiresAt: number|null}|null} [membership] QRole membership snapshot
+ * @param {object} [opts]
+ * @param {string|null} [opts.provider] OAuth provider of the login
+ * @param {{tier: string|null, expiresAt: number|null, tierName?: string|null}|null} [opts.membership] QRole membership snapshot
+ * @param {TokenExchangeResult|null} [opts.tokens] Token response (QRole refresh token)
  */
-function loginSession(req, handle, userRecord, membership = null) {
+function loginSession(req, handle, userRecord, { provider = null, membership = null, tokens = null } = {}) {
     req.session.handle = handle;
     req.session.version = getAccountVersion(userRecord);
     req.session.stcOauthPending = null;
+    req.session.stcQroleExport = null;
     if (membership) {
-        setUserMeta(handle, {
-            qroleTier: membership.tier,
-            qroleMembershipExpiresAt: membership.expiresAt,
-            qroleCheckedAt: Date.now(),
-        });
+        setUserMeta(handle, buildMembershipSnapshot(getUserMeta(handle), { ...membership, allowed: true }, Date.now()));
+    }
+    if (provider === 'qrole') {
+        syncQroleRefreshToken(handle, tokens, getQroleLifecycleConfig());
     }
     recordLogin(handle);
+}
+
+/**
+ * Export-only access for a QRole identity whose membership lapsed (or who is not a member) but
+ * that is linked to an existing account: the account keeps its data and the user may download it
+ * from /qrole-expired, without being logged in. Only for `membership_expired` / `not_member`,
+ * while `oauth.qrole.expiredDataExport` is on, and for enabled, non-admin accounts.
+ * @param {import('express').Request} req
+ * @param {{id: string, claims?: object}} identity QRole identity
+ * @param {{allowed: boolean, code: string|null, tier: string|null, expiresAt: number|null}} membership Denied evaluation
+ * @param {TokenExchangeResult} tokens Token response (the refresh token is kept like at login)
+ * @returns {Promise<boolean>} true when the export session was started
+ */
+async function startQroleExportAccess(req, identity, membership, tokens) {
+    if (membership.code !== 'membership_expired' && membership.code !== 'not_member') return false;
+    const lifecycle = getQroleLifecycleConfig();
+    if (!lifecycle.expiredDataExport || !lifecycle.requireMembership) return false;
+
+    const linked = await resolveLinkedAccount('qrole', identity.id);
+    if (!linked || linked.record.enabled === false || linked.record.admin) return false;
+
+    const now = Date.now();
+    const meta = getUserMeta(linked.handle);
+    const snapshot = buildMembershipSnapshot(meta, { ...membership, tierName: getQroleTierName(identity.claims) }, now, { denied: true });
+    setUserMeta(linked.handle, snapshot);
+    syncQroleRefreshToken(linked.handle, tokens, lifecycle, now);
+    flushMetadata();
+
+    // QRole reports a lapsed membership as tier `free`; the kept expiry tells it apart from "never a member"
+    const { state } = getQroleAccountState({ ...meta, ...snapshot }, getStcConfig('oauth.qrole', {}), now);
+    const reason = stateToReason(state) || /** @type {'membership_expired'|'not_member'} */ (membership.code);
+    startExportSession(req, { handle: linked.handle, oauthUserId: identity.id, record: linked.record, reason });
+    console.info(`[STC-MOD] QRole login of ${linked.handle} denied (${reason}); export-only access granted`);
+    return true;
 }
 
 // NOTE: /pending and /complete-registration must be declared before /:provider
@@ -610,7 +503,7 @@ router.post('/complete-registration', async (req, res) => {
         }
 
         req.session.stcOauthPending = null;
-        loginSession(req, userHandle, record, membership);
+        loginSession(req, userHandle, record, { provider: pending.provider, membership });
 
         return res.json({ success: true, handle: userHandle });
     } catch (error) {
@@ -678,12 +571,12 @@ router.get('/:provider/callback', async (req, res) => {
         }
 
         const callbackUrl = getCallbackUrl(req, provider);
-        const accessToken = await exchangeCode(provider, config, code, callbackUrl, flow.verifier || null);
-        if (!accessToken) {
+        const tokens = await exchangeCode(provider, config, code, callbackUrl, flow.verifier || null);
+        if (!tokens) {
             return redirectOauthError(res, 'token_failed');
         }
 
-        const identity = await fetchIdentity(provider, config, accessToken);
+        const identity = await fetchIdentity(provider, config, tokens.accessToken);
         if (!identity) {
             return redirectOauthError(res, 'userinfo_failed');
         }
@@ -691,15 +584,20 @@ router.get('/:provider/callback', async (req, res) => {
         // QRole: checked on every login, new and existing accounts alike
         let membership = null;
         if (provider === 'qrole') {
-            membership = evaluateQroleMembership(identity.claims, config);
-            if (!membership.allowed) {
-                if (membership.code === 'membership_unknown') {
+            const evaluation = evaluateQroleMembership(identity.claims, config);
+            if (!evaluation.allowed) {
+                if (evaluation.code === 'membership_unknown') {
                     console.warn(`[STC-MOD] QRole membership could not be determined; check oauth.qrole.tierClaims/expiryClaims. Userinfo claim keys: ${describeClaimKeys(identity.claims)}`);
                 } else {
-                    console.info(`[STC-MOD] QRole login denied: ${membership.code}`);
+                    console.info(`[STC-MOD] QRole login denied: ${evaluation.code}`);
                 }
-                return redirectOauthError(res, membership.code);
+                // Lapsed members with an account may still download their data
+                if (await startQroleExportAccess(req, identity, evaluation, tokens)) {
+                    return res.redirect('/qrole-expired');
+                }
+                return redirectOauthError(res, evaluation.code);
             }
+            membership = { ...evaluation, tierName: getQroleTierName(identity.claims) };
         }
 
         // Existing link
@@ -708,7 +606,7 @@ router.get('/:provider/callback', async (req, res) => {
             if (linked.record.enabled === false) {
                 return redirectOauthError(res, 'account_disabled');
             }
-            loginSession(req, linked.handle, linked.record, membership);
+            loginSession(req, linked.handle, linked.record, { provider, membership, tokens });
             return res.redirect('/');
         }
 
@@ -754,7 +652,7 @@ router.get('/:provider/callback', async (req, res) => {
             return redirectOauthError(res, 'create_failed');
         }
 
-        loginSession(req, userHandle, record, membership);
+        loginSession(req, userHandle, record, { provider, membership, tokens });
         return res.redirect('/');
     } catch (error) {
         console.error(`[STC-MOD] OAuth ${logLabel} callback error:`, error);

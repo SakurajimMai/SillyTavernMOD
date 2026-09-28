@@ -314,7 +314,8 @@ app.use(express.static(path.join(serverDirectory, 'public'), {
 | `getUserDirectories` | `user-extend.js` | 获取用户数据目录路径（用于清理数据） |
 | `toKey` | `user-extend.js` | 将 handle 转换为 node-persist 存储 key |
 | `getPasswordSalt` | `register-helper.js`、`services/account-security.js` | 生成密码盐 |
-| `getAccountVersion` | `oauth.js`、`set-password.js` | 第三方登录/改密后写入 `session.version`（与官方登录一致） |
+| `getAccountVersion` | `oauth.js`、`set-password.js`、`services/qrole-export.js` | 第三方登录/改密后写入 `session.version`（与官方登录一致）；QRole 数据导出会话绑定账号版本 |
+| `createBackupArchive` | `routes/public/qrole-export.js` | QRole 仅导出页面下载数据（与官方「备份全部数据」相同的 ZIP，按官方规则排除 API 密钥文件） |
 | `getIpAddress`、`retryAfter`（`src/express-common.js`） | `index.js`、`register.js` | 限流按 IP 计数（与官方登录限流同源） |
 | `getPasswordHash` | `register-helper.js` | 生成密码哈希 |
 | `ensurePublicDirectoriesExist` | `register-helper.js` | 确保用户公共目录存在 |
@@ -339,6 +340,7 @@ src/stc-mod/
 │   │   ├── invitation-status.js     # 邀请码状态
 │   │   ├── announcements-public.js  # 登录页公告
 │   │   ├── email-status.js          # 邮件服务状态
+│   │   ├── qrole-export.js          # QRole 会员过期后的仅导出数据 API
 │   │   └── public-config.js         # 公开配置（功能开关）
 │   └── private/
 │       ├── registration-config.js   # 注册开关（管理员）
@@ -352,6 +354,8 @@ src/stc-mod/
 │       ├── privacy-vault.js         # API 密钥保险箱（用户）
 │       ├── set-password.js          # 密码管理（用户）
 │       ├── default-config.js        # 默认模板管理（管理员）
+│       ├── qrole-status.js          # 当前用户 QRole 会员状态（到期提醒）
+│       ├── qrole-accounts.js        # QRole 账号列表、复核与过期账号清理（管理员）
 │       └── scheduled-tasks.js       # 定时任务（管理员）
 ├── services/
 │   ├── email-service.js             # 邮件服务
@@ -360,10 +364,20 @@ src/stc-mod/
 │   ├── storage-quota.js             # 存储配额
 │   ├── privacy-vault.js             # API 密钥保险箱（用户口令加密）
 │   ├── site-config.js               # 页面背景与站点信息（config.yaml `site`，校验 + 页面注入）
+│   ├── oauth-client.js              # OAuth HTTP / 客户端认证 / 身份解析（登录与后台复核共用）
+│   ├── qrole-lifecycle.js           # QRole 会员到期处理的纯逻辑（配置、会话判定、账号状态、清理日期）
+│   ├── qrole-token-crypto.js        # QRole 刷新令牌加密（AES-256-GCM，本地密钥文件）
+│   ├── qrole-reverify.js            # 用刷新令牌向 QRole 后台复核会员
+│   ├── qrole-export.js              # QRole 仅导出数据会话
+│   ├── qrole-cleanup.js             # QRole 账号列表与过期账号自动清理
+│   ├── user-deletion.js             # 删除账号（记录 + 数据目录 + 元数据），路由与清理任务共用
 │   └── default-template.js          # 默认用户模板
+├── tests/
+│   └── qrole-lifecycle.test.mjs     # QRole 到期处理纯逻辑测试（node 直接运行）
 └── public/
     ├── login.html                   # 自定义登录页（含 OAuth 按钮）
     ├── register.html                # 注册页
+    ├── qrole-expired.html           # QRole 会员过期后的仅导出数据页面
     └── welcome.html                 # 欢迎页
 ```
 
@@ -373,13 +387,17 @@ src/stc-mod/
 
 | 文件/目录 | 内容 |
 |-----------|------|
-| `user-metadata.json` | 扩展用户字段（OAuth ID、邮箱、过期时间、存储限额、密码状态等） |
+| `user-metadata.json` | 扩展用户字段（OAuth ID、邮箱、过期时间、存储限额、密码状态、QRole 会员快照与加密的刷新令牌等） |
 | `invitation-codes.json` | 邀请码数据 |
 | `storage-codes.json` | 存储激活码数据 |
 | `announcements/` | 公告数据 |
 | `default-template/` | 新用户默认配置模板 |
 | `privacy-vaults/` | API 密钥保险箱元数据（不含明文密钥） |
 | `system-monitor-history.json` | 系统监控历史 |
+| `qrole-cleanup-state.json` | QRole 过期账号清理的上次运行时间与结果 |
+| `qrole-cleanup-log.json` | QRole 过期账号清理的删除记录（最近 200 条） |
+
+QRole 刷新令牌的加密密钥 `stc-mod-token.key` **不在** `data/` 中，而是与 `config.yaml` 同目录（Docker：`config/stc-mod-token.key`），因为数据目录可能位于远程对象存储；需与配置一起备份。
 
 ## 配置项
 
@@ -422,6 +440,15 @@ oauth:
     tierClaims: [membershipTierId, membership_tier, membership.tierId, membership.tier, tier]
     expiryClaims: [membershipExpiresAt, membership_expires_at, membership.expiresAt]
     reverifyHours: 24            # 会员状态复核间隔（小时），0 = 仅按已知到期时间/等级
+    # 以下为会员到期处理配置：代码内置默认值（统一由 qrole-lifecycle.js 读取），STC 启动时不写入；
+    # default/config.yaml 中带注释列出（官方 config-init 会为已有 config.yaml 补上同样的值）
+    backgroundReverify: true     # 加密保存 QRole 刷新令牌，到期/到达复核间隔时后台向 QRole 复核
+    renewUrl: 'https://www.qqy.one/membership'   # 「去续费」链接（仅 http(s)，无效用默认值）
+    expiryReminderDays: 7        # 到期前 N 天显示续费提醒，0-60，0 = 不提醒
+    expiredDataExport: true      # 过期 / 非会员的已有账号 QRole 登录后进入仅导出数据页面
+    expiredCleanup:
+      enabled: false             # 自动清理过期 QRole 账号
+      afterDays: 90              # 保留天数，30-3650
 
 email:
   enabled: false
@@ -516,6 +543,9 @@ enableDownloadableTokenizers: false
 | GET | `/api/stc/oauth/:provider/callback` | OAuth 回调 |
 | GET | `/api/stc/oauth/pending` | 查询服务端会话中待补全（需邀请码）的第三方身份 |
 | POST | `/api/stc/oauth/complete-registration` | 完成 OAuth 注册（仅接收 `{inviteCode}`，身份取自服务端会话；需 CSRF） |
+| GET | `/api/stc/qrole-export/status` | QRole 仅导出会话的账号与会员信息（需 QRole 回调建立的导出会话，否则 401 `EXPORT_EXPIRED`） |
+| GET | `/api/stc/qrole-export/archive` | 下载该账号数据 ZIP（官方 `createBackupArchive`；403 `EXPORT_DISABLED` / 409 `EXPORT_BUSY` / 429 `EXPORT_RATE_LIMITED`） |
+| POST | `/api/stc/qrole-export/logout` | 结束导出会话（需 CSRF） |
 
 ### 私有 API（需认证）
 
@@ -531,6 +561,8 @@ enableDownloadableTokenizers: false
 | POST | `/api/stc/users/set-password` | 设置/修改密码（首次设置或修改） |
 | POST | `/api/stc/users/verify-password` | 验证当前密码 |
 | GET | `/api/stc/announcements/current` | 获取当前公告 |
+| GET | `/api/stc/qrole/status` | 当前用户的 QRole 会员状态（到期提醒；非 QRole 账号与管理员返回 `{qrole:false}`） |
+| POST | `/api/stc/qrole/refresh-status` | 立即用刷新令牌向 QRole 复核（每账号每分钟 1 次；需 CSRF） |
 
 ### 管理员 API
 
@@ -542,7 +574,11 @@ enableDownloadableTokenizers: false
 | POST | `/api/stc/invitation-codes/delete` | 删除邀请码 |
 | GET/POST | `/api/stc/email-config/config` | 获取/设置邮件配置 |
 | POST | `/api/stc/email-config/test` | 测试邮件发送 |
-| GET/POST | `/api/stc/oauth-config/config` | 获取/设置 OAuth 配置 |
+| GET/POST | `/api/stc/oauth-config/config` | 获取/设置 OAuth 配置（QRole 含会员到期处理配置） |
+| GET | `/api/stc/qrole-accounts` | QRole 账号列表（状态、到期、占用空间、刷新令牌、计划清理）与清理设置 / 上次结果 |
+| POST | `/api/stc/qrole-accounts/verify` | 用刷新令牌立即复核一个账号（`{handle}`） |
+| POST | `/api/stc/qrole-accounts/cleanup/preview` | 预览下次清理将删除的账号（不联网复核） |
+| POST | `/api/stc/qrole-accounts/cleanup/run` | 立即执行一次清理（与定时任务相同的代码路径；需已开启自动清理） |
 | GET | `/api/stc/system-load/current` | 当前系统负载 |
 | GET | `/api/stc/system-load/history` | 系统负载历史 |
 | GET/POST | `/api/stc/user-storage/config` | 存储配额配置 |
@@ -648,6 +684,10 @@ enableDownloadableTokenizers: false
 
 升级 SillyTavern 时需额外确认：官方 `POST /api/users/login` 仍挂在 `app.use('/api/users', …)` 下（QRole 密码登录拦截依赖相同挂载路径），`setUserDataMiddleware` 仍在 STC `setupPublicRoutes` 之前执行（会话校验依赖 `req.user`），`getAccountVersion` / `getPasswordSalt` 仍从 `src/users.js` 导出。
 
+### OAuth 自动开户的账号名
+
+`routes/public/register-helper.js` 的 `getOAuthHandleCandidates`：候选账号名依次为第三方用户名（非保留名、至少 2 个字符）、`<提供商>-<用户名>`（新增，如 `qrole-admin`）、`<提供商>-<用户 ID>`，都被占用时再加随机后缀。此前保留名用户（如 QRole 用户名 `admin`）会直接得到 `qrole-<用户 ID>` 这类难以辨认的账号名。已创建的账号不受影响。
+
 ### QRole `membership` 授权范围适配
 
 QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有效等级，小写；过期的付费会员为 `free`）、`membership_tier_name`、`membership_expires_at`（ISO-8601 UTC，仅 `free` 为 `null`），并支持 PKCE S256（客户端可设「强制 PKCE」）；QRole 管理员在后台「系统设置 → OAuth 应用」创建本站客户端，无需修改 QRole 的 `.env`。STC 侧改动：
@@ -659,6 +699,39 @@ QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有
 | `default/config.yaml` | 新安装的 `oauth.qrole.scope` 默认值同上，并注明 `membership` 与 PKCE 的作用 |
 | `stc-admin-panel/admin-panel.js` | QRole Scope 输入框占位符改为新默认值，并提示「仅允许会员登录」时必须包含 `membership` |
 | `services/qrole-membership.js` | 未改动：默认等级 / 到期字段已包含 `membership_tier` / `membership_expires_at`，ISO 时间字符串与 `null` 均已支持 |
+
+### QRole 会员到期处理
+
+会员过期的 QRole 用户：到期前提醒；续费后由服务器用刷新令牌在后台复核，无需重新登录；确实过期时只能进入仅导出数据的页面；管理员可查看过期账号并可选开启自动清理。全部实现位于 `src/stc-mod/`、`stc-admin-panel/` 与 `default/config.yaml`，**未新增 `server-main.js` 钩子**（仍为 6 个）。
+
+| 文件 | 说明 |
+|------|------|
+| `services/qrole-lifecycle.js`（新增） | 纯逻辑：`getQroleLifecycleConfig()`（新配置项的唯一读取入口，含默认值与范围校验）、`evaluateQroleSession`、`decideQroleSession`（会话守卫决策表，依赖注入便于测试）、`isLapseRecentlyConfirmed`（QRole 5 分钟内刚确认过未付费时不再复核）、账号状态 `active / expired / not_member`、`computeCleanupAt`、`getCleanupEligibility` / `checkCleanupStillDue`（清理删除前的最终检查）、`buildMembershipSnapshot`（QRole 把过期会员报告为 `free` 且无到期时间时保留上次的过去到期时间；`qroleDeniedAt` 在每次被拒绝登录时更新，后台复核只在缺失时设置）、`planVerificationOutcome` |
+| `services/qrole-token-crypto.js`（新增） | 刷新令牌 AES-256-GCM 加密，信封 `v1.<iv>.<tag>.<密文>`（base64url），AAD = 账号 handle；密钥 32 字节，存于 `config.yaml` 同目录的 `stc-mod-token.key`（`wx` + 0600，并发安全创建）；密钥不可用时功能降级并只记录一次警告；无法解密的令牌视为不存在并删除 |
+| `services/oauth-client.js`（新增） | 从 `oauth.js` 移出的共用代码：`requestJson`、令牌端点客户端认证（`client_secret_post/basic`）、身份 id 解析、`refresh_token` 授权 + userinfo |
+| `services/qrole-reverify.js`（新增） | `verifyQroleMembership(handle)`：刷新令牌 → userinfo（总超时 8 秒）→ 与登录相同的会员判定；userinfo 的用户 id 必须等于账号绑定的 `oauthUserId`。结果 `ok`（更新快照、`qroleVerifiedVia: 'refresh'`）、`definitive`（400 `invalid_grant`、格式错误的令牌响应、身份不符、账号被封：删除令牌）、`transient`（网络、超时、429、5xx、其他 4xx、缺少会员字段，以及 401 / `invalid_client`：保留令牌并冷却 5 分钟）、`no_token`；`invalid_client` 是本站客户端凭据的问题而非账号的问题，因此不删除令牌，并每 5 分钟最多记录一条面向管理员的警告；同一账号并发调用共享一次请求；从不抛错、不记录令牌 |
+| `services/qrole-session.js` | 守卫改为异步：快照无效且有可用令牌、未在冷却中时先后台复核，已续费则放行；QRole 在 5 分钟内刚确认过未付费（`qroleDeniedAt` 非空且 `qroleCheckedAt` 在 5 分钟内）时直接拒绝、不再复核（防止重放旧会话 Cookie 反复请求 QRole）；复核暂时失败时，仅 `membership_reverify` 在距上次复核 2 倍间隔内放行，`membership_expired` / `not_member` 一律拒绝 |
+| `services/qrole-export.js`（新增） | 仅导出会话 `req.session.stcQroleExport = {handle, oauthUserId, version, reason, createdAt}`（不设置 `req.session.handle`，官方与 STC 中间件都不会视为已登录）；每次请求校验：30 分钟内、账号存在且启用、非管理员、仍绑定同一 QRole 用户、账号版本未变、功能仍开启 |
+| `routes/public/oauth.js` | QRole 令牌响应额外读取 `refresh_token` / `refresh_token_expires_in`；登录成功时按规则保存或删除加密令牌（`requireMembership` 与 `backgroundReverify` 均开启才保存）；会员 `membership_expired` / `not_member` 且已有启用的非管理员账号时，更新快照（`qroleDeniedAt`）、保存令牌、建立导出会话并跳转 `/qrole-expired`；成功登录清除导出会话；查找已绑定账号时若该账号正在被删除，等待删除结束后重新查找（不会登录进正在删除的账号） |
+| `routes/public/qrole-export.js`（新增） | `/api/stc/qrole-export/status`、`/archive`（每账号并发 1、每小时 3 次；需官方 `backups.allowFullDataBackup`）、`/logout`；无效会话 401 `EXPORT_EXPIRED`，浏览器页面请求跳转 `/login?oauth_error=export_expired` |
+| `routes/private/qrole-status.js`（新增） | `/api/stc/qrole/status` 与 `/refresh-status`（返回的 `valid` / `reason` 与守卫在下一次页面加载时的判定一致；`valid: false` 时横幅直接跳转 `/login?oauth_error=<reason>`） |
+| `services/qrole-cleanup.js`、`routes/private/qrole-accounts.js`（新增） | 管理员账号列表（`hasRefreshToken` 与用户自己的状态接口规则一致：功能开启、令牌未过期且密钥可用）、单账号复核、清理预览与执行；定时器每小时检查（`unref`），每 24 小时最多执行一次、每次最多删除 20 个、最多联网复核 50 个（连续 3 次暂时失败，或一次 `invalid_client`，即停止复核并顺延）；每个账号处理前重新读取配置（清理被关闭则停止任务）与记录 / 元数据，持有令牌的先复核（复核期间账号变化 `no_account` → 跳过）；先统计占用空间，再在删除锁内做最终检查（`checkCleanupStillDue`：续费、改绑、被设为管理员、有新活动、清理被关闭 → 不删除）后立即删除；`POST /cleanup/run` 支持 `{background: true}`（202，管理面板轮询 `GET /cleanup/status`）；运行状态与删除日志写入 `data/stc-mod/qrole-cleanup-*.json` |
+| `services/user-deletion.js`（新增） | `deleteUserWithLock` 从 `user-extend.js` 移出，`delete-single` / `delete-batch` 与自动清理共用；可选 `precheck`（持锁后、删除前执行，返回原因即取消删除）；`isUserDeletionInProgress` / `waitForUserDeletion` 供登录流程使用 |
+| `user-metadata.js` | `sanitizeMeta()`（去除 `qroleRefreshToken`，`/api/stc/users/all-meta`、`/expiration-list` 使用）、`unsetUserMetaFields()`；新增字段 `qroleRefreshToken`（加密，永不返回）、`qroleRefreshTokenExpiresAt`、`qroleTierName`、`qroleDeniedAt`、`qroleVerifiedVia` |
+| `routes/private/oauth-config.js` | GET 返回新配置项（已填默认值）；POST 校验 `backgroundReverify`、`expiredDataExport`、`renewUrl`（`''` = 默认）、`expiryReminderDays`（0–60）、`expiredCleanup: {enabled?, afterDays?}`（30–3650） |
+| `index.js` | `/qrole-expired` 页面路由（已登录跳 `/`，无导出会话跳 `/login`，会话失效跳 `/login?oauth_error=export_expired`，否则 `sendSitePage`）；挂载上述路由并启动清理定时器；密码登录前清除导出会话 |
+| `config.js`、`services/site-config.js`、`services/storage-quota.js` | `getConfigDir()`（解析 Docker 符号链接后的配置目录）；页面类型 `qrole-expired`；`calculateUserStorageAsync()` |
+| `public/qrole-expired.html`（新增）、`public/login.html` | 仅导出页面（站点背景 / 品牌与登录页相同）；登录页 `membership_expired` / `not_member` 提示数据仍保留、续费后重新登录可恢复原账号，新增 `export_expired` |
+| `stc-admin-panel/index.js`、`style.css` | 非管理员已登录用户的到期提醒横幅（启动时与每 6 小时查询一次；关闭后按账号 + 到期时间在 24 小时内不再显示）；只有刷新令牌晚于会员到期时间失效时才提示「续费后无需重新登录」；`esc()` 同时转义引号 |
+| `stc-admin-panel/admin-panel.js` | 「OAuth 配置」QRole 新增「会员到期处理」（续费链接只在修改后才提交，未改动保存不会把空值写成默认链接）；新增「QRole 会员」标签（筛选、复核、删除 / 批量删除、自动清理设置、预览、立即执行（后台运行并轮询结果）、上次结果）；`esc()` 同时转义引号（QRole 返回的等级名称用于 `title` 属性） |
+| `default/config.yaml` | 带中文注释的新配置项 |
+| `tests/qrole-lifecycle.test.mjs`（新增） | `node src/stc-mod/tests/qrole-lifecycle.test.mjs`：令牌信封（篡改 / 错误 AAD 失败）、状态与清理日期、刷新失败分类（含 `invalid_client` 保留令牌）、守卫决策表（含 5 分钟内重放不再复核）、清理最终检查、`sanitizeMeta` |
+
+运维注意：
+- `stc-mod-token.key` 须与 `config/` 一起备份；丢失后会自动生成新密钥，旧令牌无法解密而被删除，影响仅是 QRole 用户需要重新登录一次。直接运行时该文件在项目根目录（未加入 `.gitignore`），不要提交。
+- 生产环境数据根目录在 JuiceFS 上：被自动清理删除的文件会先进入 JuiceFS 回收站（`JFS_TRASH_DAYS`，默认 7 天），代码不依赖回收站。
+
+升级 SillyTavern 时需额外确认：`createBackupArchive(handle, res)` 仍从 `src/users.js` 导出且仍在未开启 `allowKeysExposure` 时排除 `secrets.json`；`backups.allowFullDataBackup` 仍是官方完整备份开关；`setUserDataMiddleware` 只根据 `req.session.handle` 识别登录用户（导出会话依赖这一点）；`/csrf-token` 仍在登录中间件之前（导出页面退出需要 CSRF 令牌）。
 
 ## 页面背景与站点信息（`site` 配置）
 

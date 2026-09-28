@@ -330,3 +330,134 @@
         text-overflow: ellipsis;
     }
 }
+
+/* ── QRole membership expiry banner (all QRole users) ─────────── */
+#stc-qrole-banner {
+    position: fixed;
+    top: calc(var(--topBarBlockSize, 40px) + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3010;
+    width: calc(100% - 24px);
+    max-width: 640px;
+    box-sizing: border-box;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    background: rgba(30, 30, 46, 0.97);
+    color: #eee;
+    border: 1px solid rgba(243, 156, 18, 0.35);
+    border-left: 4px solid #f39c12;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+    font-size: 0.88em;
+    font-family: inherit;
+    line-height: 1.55;
+    animation: stcQroleBannerIn 0.25s ease;
+    pointer-events: auto;
+}
+
+@keyframes stcQroleBannerIn {
+    from { opacity: 0; transform: translate(-50%, -8px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+#stc-qrole-banner .stc-qrole-banner-icon {
+    color: #ffc440;
+    font-size: 1.25em;
+    margin-top: 2px;
+    flex-shrink: 0;
+    filter: drop-shadow(0 0 4px rgba(255, 196, 64, 0.45));
+}
+
+#stc-qrole-banner .stc-qrole-banner-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+#stc-qrole-banner .stc-qrole-banner-text {
+    font-weight: 600;
+    color: #f5d76e;
+    overflow-wrap: anywhere;
+}
+
+#stc-qrole-banner .stc-qrole-banner-sub {
+    font-size: 0.9em;
+    color: #ccc;
+}
+
+#stc-qrole-banner .stc-qrole-banner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+#stc-qrole-banner .stc-qrole-banner-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 7px;
+    border: 1px solid rgba(243, 156, 18, 0.45);
+    background: rgba(243, 156, 18, 0.08);
+    color: #f39c12;
+    font-size: 0.92em;
+    font-weight: 600;
+    font-family: inherit;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.2s;
+}
+
+#stc-qrole-banner .stc-qrole-banner-btn.primary {
+    border-color: transparent;
+    background: linear-gradient(135deg, #f39c12, #e67e22);
+    color: #fff;
+}
+
+#stc-qrole-banner .stc-qrole-banner-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    background: rgba(243, 156, 18, 0.16);
+}
+
+#stc-qrole-banner .stc-qrole-banner-btn.primary:hover {
+    background: linear-gradient(135deg, #f5a623, #eb8a2f);
+}
+
+#stc-qrole-banner .stc-qrole-banner-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+#stc-qrole-banner .stc-qrole-banner-close {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 1.1em;
+    line-height: 1;
+    padding: 2px 4px;
+}
+
+#stc-qrole-banner .stc-qrole-banner-close:hover {
+    color: #fff;
+}
+
+@media (max-width: 600px) {
+    #stc-qrole-banner {
+        width: calc(100% - 16px);
+        padding: 10px 12px;
+        gap: 10px;
+        font-size: 0.82em;
+    }
+    #stc-qrole-banner .stc-qrole-banner-btn {
+        flex: 1 1 auto;
+    }
+}

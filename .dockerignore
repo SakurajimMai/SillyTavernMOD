@@ -65,3 +65,5 @@ replit.nix
 # -- Logs & Temp ---
 *.log
 **/tmp
+# STC-MOD: QRole refresh-token encryption key (created next to config.yaml)
+stc-mod-token.key*

@@ -1,11 +1,12 @@
+/* eslint-env browser */
 /**
  * STC-MOD Heartbeat Client
- * 
+ *
  * Sends periodic heartbeat requests to update user activity timestamp.
  * This file is loaded independently and does not modify official code.
  */
 
-(function() {
+(function () {
     'use strict';
 
     // Configuration
@@ -41,7 +42,7 @@
 
         // Setup periodic heartbeat
         setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
-        
+
         console.log(`[STC-MOD] Heartbeat initialized (interval: ${HEARTBEAT_INTERVAL / 1000}s)`);
     }
 

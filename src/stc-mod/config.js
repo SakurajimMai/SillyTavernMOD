@@ -394,6 +394,22 @@ export function ensureDefaultConfig() {
     }
 }
 
+/**
+ * Directory of the config.yaml STC-MOD reads, with symlinks resolved (Docker links
+ * config.yaml -> ./config/config.yaml, so this is the persistent, mounted config directory).
+ * Local secrets that must NOT live under the data root (which may be remote object storage)
+ * are kept here.
+ * @returns {string}
+ */
+export function getConfigDir() {
+    const configPath = getConfigPath();
+    try {
+        return path.dirname(resolveWriteTarget(configPath));
+    } catch {
+        return path.dirname(configPath);
+    }
+}
+
 export function getDataRoot() {
     return globalThis.DATA_ROOT || path.join(process.cwd(), 'data');
 }

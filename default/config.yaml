@@ -455,6 +455,22 @@ oauth:
     #   - membership.expiresAt
     # 会员状态复核间隔（小时）：超过后需重新使用 QRole 登录以确认会员仍有效；0 = 仅按已知到期时间和等级判断
     reverifyHours: 24
+    # 后台自动复核会员：登录时保存 QRole 刷新令牌（加密存储，密钥为 config.yaml 同目录的 stc-mod-token.key，
+    # 请与配置一同备份；丢失只会让用户重新登录一次）。会员到期或到达复核间隔时在后台向 QRole 确认，
+    # 用户续费后无需重新登录。刷新令牌有效期 30 天，过期后需重新使用 QRole 登录
+    backgroundReverify: true
+    # 「去续费」按钮的链接（仅支持 http/https，无效时使用默认值）
+    renewUrl: 'https://www.qqy.one/membership'
+    # 会员到期前多少天在页面顶部显示续费提醒（0 = 不提醒，最大 60）
+    expiryReminderDays: 7
+    # 会员过期（或非会员）的已有账号使用 QRole 登录时，进入仅可下载数据的页面（不会登录进系统）
+    expiredDataExport: true
+    # 自动清理过期 QRole 账号（默认关闭）：会员过期 / 最后活跃 / 最后登录中最晚的时间再过 afterDays 天后，
+    # 删除账号及其全部数据（删除前会先向 QRole 复核，已续费的账号保留；每次最多删除 20 个，每天最多执行一次）
+    expiredCleanup:
+      enabled: false
+      # 30 - 3650 天
+      afterDays: 90
 
 email:
   enabled: false

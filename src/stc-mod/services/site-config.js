@@ -1,6 +1,6 @@
 /**
  * SillyTavernchat Module - Site appearance (config.yaml `site`)
- * Page background and site info of the STC public pages (welcome / login / register).
+ * Page background and site info of the STC public pages (welcome / login / register / qrole-expired).
  * The values are read on every request, so edits to config.yaml apply on the next page load.
  */
 import fs from 'node:fs';
@@ -281,13 +281,14 @@ const PAGE_TITLES = Object.freeze({
     welcome: name => name,
     login: name => `${name} - 登录`,
     register: name => `${name} - 注册账号`,
+    'qrole-expired': name => `${name} - QRole 会员`,
 });
 
 /**
  * Render an STC public page with the site settings: the first <title> gets the configured site
  * name and `<script>window.STC_SITE = {...};</script>` is inserted right before </head>.
  * @param {string} fileName File in src/stc-mod/public (e.g. 'login.html')
- * @param {'welcome'|'login'|'register'} pageKind
+ * @param {'welcome'|'login'|'register'|'qrole-expired'} pageKind
  * @returns {Promise<string>} HTML
  */
 export async function renderSitePage(fileName, pageKind) {
@@ -313,7 +314,7 @@ export async function renderSitePage(fileName, pageKind) {
  * Falls back to the static file when rendering fails.
  * @param {import('express').Response} res
  * @param {string} fileName File in src/stc-mod/public
- * @param {'welcome'|'login'|'register'} pageKind
+ * @param {'welcome'|'login'|'register'|'qrole-expired'} pageKind
  */
 export async function sendSitePage(res, fileName, pageKind) {
     let html;

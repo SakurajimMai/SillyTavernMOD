@@ -21,6 +21,8 @@ public/stats.json
 *.jsonl
 /config.conf
 /config.yaml
+# STC-MOD: QRole refresh-token encryption key (created next to config.yaml) and its temp files
+stc-mod-token.key*
 /config.conf.bak
 /docker/config
 /docker/user

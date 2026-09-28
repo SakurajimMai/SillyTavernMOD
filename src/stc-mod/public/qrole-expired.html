@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <base href="/">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, viewport-fit=cover, initial-scale=1, maximum-scale=1.0, user-scalable=no">
+    <meta name="darkreader-lock">
+    <meta name="robots" content="noindex, nofollow" />
+    <link rel="icon" href="favicon.ico" type="image/x-icon">
+    <link rel="stylesheet" type="text/css" href="css/fontawesome.min.css">
+    <link rel="stylesheet" type="text/css" href="css/solid.min.css">
+    <link href="webfonts/NotoSans/stylesheet.css" rel="stylesheet">
+    <title>SillyTavern - QRole 会员</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Noto Sans', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow-x: hidden;
+            background: #080518;
+            color: #eee;
+            padding: 24px 16px;
+        }
+
+        /* ── Background (same as the login / register pages) ── */
+        #stc-bg-video {
+            position: fixed; inset: 0;
+            width: 100%; height: 100%;
+            object-fit: cover; z-index: 0; pointer-events: none;
+        }
+        #stc-bg-overlay {
+            position: fixed; inset: 0; z-index: 1;
+            background: rgba(6, 3, 20, 0.52);
+        }
+        #stc-sakura { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+
+        /* ── Glass card ── */
+        .card {
+            position: relative; z-index: 3;
+            background: rgba(255, 255, 255, 0.055);
+            backdrop-filter: blur(36px);
+            -webkit-backdrop-filter: blur(36px);
+            border: 1px solid rgba(220, 160, 255, 0.22);
+            border-radius: 26px;
+            padding: 40px 36px 34px;
+            width: 100%; max-width: 460px;
+            box-shadow:
+                0 0 0 1px rgba(255, 160, 220, 0.06) inset,
+                0 0 60px rgba(150, 80, 255, 0.16),
+                0 24px 80px rgba(0,0,0,.5);
+            animation: fadeUp .55s cubic-bezier(.22,1,.36,1) both;
+            overflow: hidden;
+        }
+        .card::before {
+            content: '';
+            position: absolute; inset: 0; border-radius: inherit;
+            background: linear-gradient(135deg,
+                rgba(255,150,220,.05) 0%, transparent 45%,
+                rgba(108,99,255,.04) 100%);
+            pointer-events: none; z-index: 0;
+        }
+        .card::after {
+            content: '';
+            position: absolute; inset: 0; border-radius: inherit;
+            background: repeating-linear-gradient(
+                0deg, transparent, transparent 3px,
+                rgba(255,255,255,.007) 3px, rgba(255,255,255,.007) 4px
+            );
+            pointer-events: none; z-index: 0;
+        }
+        .card > :not(.card-corner) { position: relative; z-index: 1; }
+        .card-corner {
+            position: absolute; width: 20px; height: 20px;
+            border-color: rgba(255, 140, 210, 0.5);
+            border-style: solid; z-index: 2; pointer-events: none;
+        }
+        .card-corner.tl { top:14px; left:14px; border-width:2px 0 0 2px; border-radius:4px 0 0 0; }
+        .card-corner.tr { top:14px; right:14px; border-width:2px 2px 0 0; border-radius:0 4px 0 0; }
+        .card-corner.bl { bottom:14px; left:14px; border-width:0 0 2px 2px; border-radius:0 0 0 4px; }
+        .card-corner.br { bottom:14px; right:14px; border-width:0 2px 2px 0; border-radius:0 0 4px 0; }
+        @keyframes fadeUp {
+            from { opacity:0; transform:translateY(28px) scale(.97); }
+            to   { opacity:1; transform:translateY(0) scale(1); }
+        }
+
+        /* ── Header ── */
+        .card-header { text-align: center; margin-bottom: 22px; }
+        .anime-badge {
+            display: inline-block;
+            font-size: .65em; letter-spacing: .22em; font-weight: 700;
+            color: rgba(255, 170, 230, 0.7); margin-bottom: 14px; text-transform: uppercase;
+        }
+        .anime-badge::before { content: '◈ '; color: rgba(200,130,255,.6); }
+        .anime-badge::after  { content: ' ◈'; color: rgba(200,130,255,.6); }
+        .site-logo {
+            display: block; width: 68px; height: 68px; margin: 0 auto 12px;
+            border-radius: 50%; object-fit: contain; padding: 6px;
+            background: rgba(160,80,255,.12);
+            border: 2px solid rgba(200,130,255,.38);
+            box-shadow: 0 0 36px rgba(200,100,255,.32);
+            animation: pulse 3.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%,100% { box-shadow: 0 0 30px rgba(200,100,255,.32); }
+            50%      { box-shadow: 0 0 56px rgba(200,100,255,.58), 0 0 20px rgba(255,140,210,.2); }
+        }
+        .site-name {
+            font-size: 1.35em; font-weight: 800; letter-spacing: -.3px;
+            background: linear-gradient(135deg,#fff 20%,#d8a8ff 60%,#ffb0d8);
+            -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+            overflow-wrap: anywhere;
+        }
+
+        /* ── Loading / error ── */
+        #loadingState {
+            text-align: center; padding: 24px 0;
+            color: rgba(255,255,255,.45); font-size: .9em;
+            display: flex; align-items: center; justify-content: center; gap: 10px;
+        }
+        #loadError {
+            padding: 12px 16px; border-radius: 10px; margin-bottom: 8px;
+            background: rgba(231,76,60,.08); border: 1px solid rgba(231,76,60,.25); color: #f08080;
+            font-size: .85em; text-align: center; line-height: 1.6;
+        }
+        #loadError a { color: #f08080; }
+
+        /* ── Status panel ── */
+        .status-panel {
+            text-align: center; padding: 18px 16px; margin-bottom: 16px; border-radius: 14px;
+            background: rgba(255,196,64,.07); border: 1px solid rgba(255,196,64,.28);
+        }
+        .status-panel .status-icon {
+            display: block; font-size: 2em; margin-bottom: 8px; color: #ffc440;
+            filter: drop-shadow(0 0 6px rgba(255,196,64,.45));
+        }
+        .status-panel h1 { font-size: 1.12em; font-weight: 700; color: #ffe7a8; margin-bottom: 6px; }
+        .status-panel p { font-size: .84em; color: rgba(255,235,200,.62); line-height: 1.65; }
+
+        .info-list {
+            margin-bottom: 14px; border-radius: 12px; overflow: hidden;
+            border: 1px solid rgba(200,140,255,.16); background: rgba(255,255,255,.035);
+        }
+        .info-row {
+            display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+            padding: 10px 14px; font-size: .86em;
+        }
+        .info-row + .info-row { border-top: 1px solid rgba(200,140,255,.1); }
+        .info-row dt { color: rgba(255,210,245,.5); flex-shrink: 0; }
+        .info-row dd { color: #eee; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+
+        .notice {
+            display: flex; align-items: flex-start; gap: 9px;
+            padding: 10px 14px; margin-bottom: 12px; border-radius: 10px;
+            font-size: .84em; line-height: 1.6;
+        }
+        .notice i { margin-top: 3px; flex-shrink: 0; }
+        .notice.ok   { background: rgba(46,204,113,.08); border: 1px solid rgba(46,204,113,.28); color: #8fe6b3; }
+        .notice.warn { background: rgba(231,76,60,.09); border: 1px solid rgba(231,76,60,.3); color: #ffaac0; }
+
+        /* ── Buttons ── */
+        .actions { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+        .btn {
+            padding: 12px 18px; border-radius: 10px;
+            font-size: .92em; font-weight: 600; font-family: inherit; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            text-decoration: none; transition: all .2s; border: 1px solid transparent;
+            width: 100%;
+        }
+        .btn:disabled { opacity: .5; cursor: not-allowed; transform: none !important; }
+        .btn-renew {
+            background: linear-gradient(135deg, #f5b041, #f39c12, #e67e22);
+            color: #fff; border-color: rgba(255,220,150,.25);
+            box-shadow: 0 6px 22px rgba(243,156,18,.35);
+        }
+        .btn-renew:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(243,156,18,.5); }
+        .btn-primary {
+            background: linear-gradient(135deg, #7c6fff, #c060ff, #4a90e2);
+            color: #fff; border-color: rgba(255,150,220,.2);
+            box-shadow: 0 6px 22px rgba(160,60,255,.4);
+        }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(180,80,255,.55); }
+        .btn-secondary {
+            background: rgba(255,255,255,.07); border-color: rgba(200,140,255,.25);
+            color: rgba(255,225,250,.85);
+        }
+        .btn-secondary:hover:not(:disabled) { background: rgba(200,100,255,.12); transform: translateY(-1px); border-color: rgba(200,140,255,.4); }
+        .btn-ghost {
+            background: transparent; border-color: rgba(255,255,255,.1);
+            color: rgba(255,255,255,.55); font-weight: 500;
+        }
+        .btn-ghost:hover:not(:disabled) { background: rgba(255,255,255,.06); color: rgba(255,255,255,.8); }
+
+        .hint { font-size: .78em; color: rgba(255,200,240,.4); text-align: center; line-height: 1.5; }
+
+        .msg {
+            font-size: .84em; text-align: center; padding: 10px 14px;
+            border-radius: 9px; line-height: 1.55; display: none;
+        }
+        .msg.info    { background: rgba(74,144,226,.1); border: 1px solid rgba(74,144,226,.3); color: #a9cbf5; }
+        .msg.error   { background: rgba(231,76,60,.1); border: 1px solid rgba(231,76,60,.3); color: #f08080; }
+        .msg.success { background: rgba(46,204,113,.1); border: 1px solid rgba(46,204,113,.3); color: #2ecc71; }
+
+        .footnote {
+            margin-top: 16px; font-size: .76em; line-height: 1.6;
+            color: rgba(255,200,240,.32); text-align: center;
+        }
+
+        @media (max-width: 480px) {
+            body { padding: 16px 10px; align-items: flex-start; }
+            .card { padding: 30px 20px 26px; border-radius: 20px; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Site settings (config.yaml → site). The server injects window.STC_SITE at the end of the head; when the page is served statically it is absent and these defaults apply. -->
+<script>
+const STC_SITE_DEFAULTS = Object.freeze({
+    name: 'SillyTavern',
+    badge: 'Silly Tavern',
+    subtitle: 'AI 角色扮演与对话平台',
+    subtitle2: 'Creative · Immersive · Extensible',
+    logoUrl: 'img/logo.png',
+    background: Object.freeze({
+        pcVideoUrl: 'https://t.alcy.cc/acg',
+        pcImageUrl: '',
+        mobileImageUrl: 'https://t.alcy.cc/moemp',
+        fallback: 'linear-gradient(125deg,#06040f 0%,#180d3a 40%,#0d1b3e 70%,#06040f 100%)',
+        overlayOpacity: 0.52,
+        sakura: true,
+    }),
+    features: Object.freeze([
+        Object.freeze({ icon: 'fa-solid fa-comments', title: 'AI 对话', text: '支持多种 LLM 模型' }),
+        Object.freeze({ icon: 'fa-solid fa-masks-theater', title: '角色扮演', text: '丰富的角色卡系统' }),
+        Object.freeze({ icon: 'fa-solid fa-palette', title: '个性化', text: '主题和界面定制' }),
+        Object.freeze({ icon: 'fa-solid fa-puzzle-piece', title: '扩展', text: '强大的扩展生态' }),
+    ]),
+});
+
+/* Merged per key over the defaults (a missing or invalid key keeps its default). The server already
+   normalizes these values; they are re-checked here as defense in depth and only ever used as
+   text / DOM properties, never as HTML. */
+const SITE = (function(defaults, injected) {
+    const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+    const raw = isObject(injected) ? injected : {};
+    const rawBg = isObject(raw.background) ? raw.background : {};
+    const defBg = defaults.background;
+
+    function text(value, fallback, max, allowEmpty) {
+        if (typeof value !== 'string') return fallback;
+        const v = Array.from(value.replace(/\p{Cc}/gu, '').trim()).slice(0, max).join('');
+        return (v || allowEmpty) ? v : fallback;
+    }
+    // http(s) or relative (resolved against <base href="/">) only
+    function url(value, fallback, allowEmpty) {
+        if (typeof value !== 'string') return fallback;
+        const v = value.trim();
+        if (!v) return allowEmpty ? '' : fallback;
+        if (v.length > 1024) return fallback;
+        try {
+            const parsed = new URL(v, document.baseURI);
+            return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? v : fallback;
+        } catch {
+            return fallback;
+        }
+    }
+    // CSS color / gradient only
+    function cssBackground(value, fallback) {
+        if (typeof value !== 'string') return fallback;
+        const v = value.trim();
+        if (!v || v.length > 300 || /[<>;{}\\]/.test(v) || /url\(|expression\(/i.test(v)) return fallback;
+        return v;
+    }
+    function opacity(value, fallback) {
+        const n = typeof value === 'number' ? value
+            : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+        return (Number.isFinite(n) && n >= 0 && n <= 1) ? n : fallback;
+    }
+    function features(value, fallback) {
+        if (!Array.isArray(value)) return fallback;
+        const list = [];
+        for (const item of value) {
+            if (list.length >= 8) break;
+            if (!isObject(item)) continue;
+            const title = text(item.title, '', 30, true);
+            if (!title) continue;
+            const icon = typeof item.icon === 'string' ? item.icon.trim() : '';
+            list.push({
+                icon: (/^[a-z0-9 -]{1,60}$/.test(icon) && icon.includes('fa-')) ? icon : 'fa-solid fa-star',
+                title,
+                text: text(item.text, '', 80, true),
+            });
+        }
+        return list;
+    }
+
+    return {
+        name: text(raw.name, defaults.name, 60, false),
+        badge: text(raw.badge, defaults.badge, 60, true),
+        subtitle: text(raw.subtitle, defaults.subtitle, 120, true),
+        subtitle2: text(raw.subtitle2, defaults.subtitle2, 120, true),
+        logoUrl: url(raw.logoUrl, defaults.logoUrl, false),
+        background: {
+            pcVideoUrl: url(rawBg.pcVideoUrl, defBg.pcVideoUrl, true),
+            pcImageUrl: url(rawBg.pcImageUrl, defBg.pcImageUrl, true),
+            mobileImageUrl: url(rawBg.mobileImageUrl, defBg.mobileImageUrl, true),
+            fallback: cssBackground(rawBg.fallback, defBg.fallback),
+            overlayOpacity: opacity(rawBg.overlayOpacity, defBg.overlayOpacity),
+            sakura: typeof rawBg.sakura === 'boolean' ? rawBg.sakura : defBg.sakura,
+        },
+        features: features(raw.features, defaults.features),
+    };
+})(STC_SITE_DEFAULTS, window.STC_SITE);
+</script>
+<div id="stc-bg-overlay"></div>
+<!-- Adaptive background (config.yaml → site.background): image on mobile, video (or image) on PC -->
+<script>
+(function() {
+    const bg = SITE.background;
+    const overlay = document.getElementById('stc-bg-overlay');
+    const mobile = window.matchMedia('(max-width:1023px)').matches ||
+        /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+
+    // Overlay keeps its rgb(6, 3, 20) tint; only the alpha is configurable
+    if (overlay) overlay.style.background = 'rgba(6, 3, 20, ' + (Math.round(bg.overlayOpacity * 1000) / 1000) + ')';
+
+    let fallbackShown = false;
+    function showFallback() {
+        if (!overlay || fallbackShown) return;
+        fallbackShown = true;
+        overlay.style.background = '';
+        overlay.style.background = bg.fallback;
+        // A value the browser rejects leaves the style empty: use the built-in gradient instead
+        if (!overlay.style.background) overlay.style.background = STC_SITE_DEFAULTS.background.fallback;
+    }
+
+    let src = '';
+    let isVideo = false;
+    if (mobile) {
+        src = bg.mobileImageUrl || bg.pcImageUrl;
+    } else if (bg.pcVideoUrl) {
+        src = bg.pcVideoUrl;
+        isVideo = true;
+    } else {
+        src = bg.pcImageUrl;
+    }
+    if (!src) {
+        showFallback();
+        return;
+    }
+
+    let el;
+    function onVideoError() {
+        // Video failed: show the PC image instead when configured, otherwise the fallback
+        if (!bg.pcImageUrl || !el || el.tagName !== 'VIDEO') return showFallback();
+        const img = document.createElement('img');
+        img.id = 'stc-bg-video';
+        img.alt = '';
+        img.addEventListener('error', showFallback);
+        img.src = bg.pcImageUrl;
+        el.replaceWith(img);
+        el = img;
+    }
+    if (isVideo) {
+        el = document.createElement('video');
+        el.autoplay = true; el.muted = true; el.loop = true;
+        el.setAttribute('playsinline', '');
+        // pcImageUrl is shown while the video loads and replaces it if the video fails
+        if (bg.pcImageUrl) el.poster = bg.pcImageUrl;
+        const s = document.createElement('source');
+        s.src = src; s.type = 'video/mp4';
+        // A failing <source> fires "error" on the <source> itself, not on the <video>
+        s.addEventListener('error', onVideoError);
+        el.appendChild(s);
+    } else {
+        el = document.createElement('img');
+        el.src = src;
+        el.alt = '';
+    }
+    el.id = 'stc-bg-video';
+    el.addEventListener('error', isVideo ? onVideoError : showFallback);
+    if (overlay) overlay.insertAdjacentElement('beforebegin', el);
+    else document.currentScript.insertAdjacentElement('beforebegin', el);
+})();
+</script>
+
+<canvas id="stc-sakura"></canvas>
+
+<div class="card">
+    <div class="card-corner tl"></div>
+    <div class="card-corner tr"></div>
+    <div class="card-corner bl"></div>
+    <div class="card-corner br"></div>
+
+    <div class="card-header">
+        <div class="anime-badge">QRole Membership</div>
+        <img id="siteLogo" class="site-logo" src="img/logo.png" alt="SillyTavern">
+        <div id="siteName" class="site-name">SillyTavern</div>
+    </div>
+
+    <div id="loadingState">
+        <i class="fa-solid fa-spinner fa-spin"></i> 正在加载账号信息...
+    </div>
+
+    <div id="loadError" style="display:none" role="alert">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        无法加载账号信息，请检查网络后
+        <a id="retryLoad" href="#">重试</a>
+    </div>
+
+    <div id="exportContent" style="display:none">
+        <div class="status-panel">
+            <i class="fa-solid fa-crown status-icon" aria-hidden="true"></i>
+            <h1 id="statusTitle">QRole 会员已过期</h1>
+            <p id="statusDesc"></p>
+        </div>
+
+        <dl class="info-list">
+            <div class="info-row"><dt>账号</dt><dd id="infoHandle">—</dd></div>
+            <div class="info-row"><dt>会员等级</dt><dd id="infoTier">—</dd></div>
+            <div class="info-row" id="infoExpiryRow"><dt>会员到期时间</dt><dd id="infoExpiry">—</dd></div>
+        </dl>
+
+        <div class="notice ok">
+            <i class="fa-solid fa-shield-heart" aria-hidden="true"></i>
+            <span>您的角色卡、聊天记录等数据仍然保留</span>
+        </div>
+        <div id="cleanupNotice" class="notice warn" style="display:none">
+            <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+            <span id="cleanupText"></span>
+        </div>
+
+        <div class="actions">
+            <a id="renewBtn" class="btn btn-renew" href="https://www.qqy.one/membership" target="_blank" rel="noopener noreferrer">
+                <i class="fa-solid fa-crown"></i> 去续费
+            </a>
+            <a id="reloginBtn" class="btn btn-primary" href="/api/stc/oauth/qrole">
+                <i class="fa-solid fa-right-to-bracket"></i> 续费后重新登录
+            </a>
+            <button id="downloadBtn" class="btn btn-secondary" type="button">
+                <i class="fa-solid fa-file-zipper"></i> 下载我的数据（ZIP）
+            </button>
+            <div id="downloadHint" class="hint" style="display:none"></div>
+            <div id="msg" class="msg" role="status" aria-live="polite"></div>
+            <button id="logoutBtn" class="btn btn-ghost" type="button">
+                <i class="fa-solid fa-right-from-bracket"></i> 退出
+            </button>
+        </div>
+
+        <div class="footnote">
+            续费完成后点击「续费后重新登录」即可继续使用原账号。<br>
+            本页面仅用于续费和导出数据，登录后 30 分钟内有效。
+        </div>
+    </div>
+</div>
+
+<script>
+/* QRole export-only page: the server session only allows GET /api/stc/qrole-export/status,
+   GET /api/stc/qrole-export/archive and POST /api/stc/qrole-export/logout.
+   Every server value is written with textContent / DOM properties, never as HTML. */
+(function() {
+    const DEFAULT_RENEW_URL = 'https://www.qqy.one/membership';
+    const EXPIRED_LOGIN_URL = '/login?oauth_error=export_expired';
+    const REASON_TEXTS = {
+        membership_expired: {
+            title: 'QRole 会员已过期',
+            desc: '您的 QRole 会员已到期。续费后重新使用 QRole 登录，即可继续使用原账号。',
+        },
+        not_member: {
+            title: '当前 QRole 账号不是会员',
+            desc: '当前 QRole 账号没有有效的会员等级。开通或续费会员后重新使用 QRole 登录，即可继续使用原账号。',
+        },
+    };
+    const DOWNLOAD_BUTTON_HTML = '<i class="fa-solid fa-file-zipper"></i> 下载我的数据（ZIP）';
+
+    let status = null;
+    let downloading = false;
+    let csrfTokenPromise = null;
+
+    const $ = id => document.getElementById(id);
+
+    // Site brand (config.yaml → site): DOM properties only
+    document.title = SITE.name + ' - QRole 会员';
+    if ($('siteLogo').getAttribute('src') !== SITE.logoUrl) $('siteLogo').src = SITE.logoUrl;
+    $('siteLogo').alt = SITE.name;
+    $('siteName').textContent = SITE.name;
+
+    function setDisplay(id, value) {
+        $(id).style.display = value;
+    }
+
+    function showMsg(text, type) {
+        const el = $('msg');
+        el.className = 'msg ' + type;
+        el.textContent = text;
+        el.style.display = text ? 'block' : 'none';
+    }
+
+    // Absolute http(s) links only (blocks javascript:/data: URLs)
+    function safeHttpUrl(value) {
+        if (typeof value !== 'string' || !value.trim()) return '';
+        try {
+            const url = new URL(value.trim());
+            return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : '';
+        } catch {
+            return '';
+        }
+    }
+
+    // ms number, seconds number or ISO string → ms (null when missing/invalid)
+    function toTimestamp(value) {
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+            return value < 1e12 ? value * 1000 : value;
+        }
+        if (typeof value === 'string' && value.trim()) {
+            const parsed = Date.parse(value);
+            return Number.isFinite(parsed) ? parsed : null;
+        }
+        return null;
+    }
+
+    function pad(n) {
+        return String(n).padStart(2, '0');
+    }
+
+    function formatDate(ms) {
+        const d = new Date(ms);
+        return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    }
+
+    function formatDateTime(ms) {
+        const d = new Date(ms);
+        return formatDate(ms) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+
+    function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes < 0) return '';
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+        return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    }
+
+    function shortText(value, max) {
+        return typeof value === 'string' ? Array.from(value.replace(/\p{Cc}/gu, '').trim()).slice(0, max).join('') : '';
+    }
+
+    async function readJson(resp) {
+        try {
+            const data = await resp.json();
+            return data && typeof data === 'object' ? data : {};
+        } catch {
+            return {};
+        }
+    }
+
+    /* CSRF token for POST requests (cached; fetched again next time if it fails) */
+    function getCsrfToken() {
+        if (!csrfTokenPromise) {
+            csrfTokenPromise = fetch('/csrf-token', { cache: 'no-store' })
+                .then(resp => {
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    return resp.json();
+                })
+                .then(data => String(data?.token ?? ''))
+                .catch(e => {
+                    csrfTokenPromise = null;
+                    throw e;
+                });
+        }
+        return csrfTokenPromise;
+    }
+
+    function sessionExpired() {
+        location.replace(EXPIRED_LOGIN_URL);
+    }
+
+    function render(data) {
+        status = data;
+        const reason = Object.prototype.hasOwnProperty.call(REASON_TEXTS, data.reason) ? data.reason : 'membership_expired';
+        $('statusTitle').textContent = REASON_TEXTS[reason].title;
+        $('statusDesc').textContent = REASON_TEXTS[reason].desc;
+
+        $('infoHandle').textContent = shortText(data.handle, 64) || '—';
+        // QRole's display name of the tier when known, else the tier id
+        const tierName = shortText(data.tierName, 32);
+        const tier = shortText(data.tier, 32);
+        $('infoTier').textContent = tierName || (tier ? tier.toUpperCase() : '无');
+        const expiresAt = toTimestamp(data.expiresAt);
+        if (expiresAt !== null) {
+            $('infoExpiry').textContent = formatDateTime(expiresAt);
+            setDisplay('infoExpiryRow', '');
+        } else {
+            setDisplay('infoExpiryRow', 'none');
+        }
+
+        const cleanupAt = toTimestamp(data.cleanupAt);
+        if (cleanupAt !== null) {
+            $('cleanupText').textContent = cleanupAt > Date.now()
+                ? '账号将于 ' + formatDate(cleanupAt) + ' 后被自动清理，请及时续费或导出数据'
+                : '账号已到达自动清理时间，可能随时被清理，请尽快续费或导出数据';
+            setDisplay('cleanupNotice', '');
+        } else {
+            setDisplay('cleanupNotice', 'none');
+        }
+
+        $('renewBtn').href = safeHttpUrl(data.renewUrl) || DEFAULT_RENEW_URL;
+
+        const downloadBtn = $('downloadBtn');
+        if (data.exportAvailable === false) {
+            downloadBtn.disabled = true;
+            $('downloadHint').textContent = '管理员未开放数据备份下载，如需导出数据请联系管理员';
+            setDisplay('downloadHint', '');
+        } else {
+            downloadBtn.disabled = false;
+            setDisplay('downloadHint', 'none');
+        }
+
+        setDisplay('loadingState', 'none');
+        setDisplay('loadError', 'none');
+        setDisplay('exportContent', '');
+    }
+
+    async function loadStatus() {
+        setDisplay('loadError', 'none');
+        setDisplay('loadingState', 'flex');
+        let resp;
+        try {
+            resp = await fetch('/api/stc/qrole-export/status', { cache: 'no-store' });
+        } catch {
+            setDisplay('loadingState', 'none');
+            setDisplay('loadError', '');
+            return;
+        }
+        if (resp.status === 401 || resp.status === 403) return sessionExpired();
+        if (!resp.ok) {
+            setDisplay('loadingState', 'none');
+            setDisplay('loadError', '');
+            return;
+        }
+        render(await readJson(resp));
+    }
+
+    // Keep only a plain file name from Content-Disposition (no paths / control characters)
+    function fileNameFromDisposition(header) {
+        if (typeof header !== 'string') return '';
+        let name = '';
+        const encoded = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(header);
+        if (encoded) {
+            try {
+                name = decodeURIComponent(encoded[1].trim());
+            } catch {
+                name = '';
+            }
+        }
+        if (!name) {
+            const plain = /filename\s*=\s*"([^"]*)"|filename\s*=\s*([^;]+)/.exec(header);
+            if (plain) name = (plain[1] ?? plain[2] ?? '').trim();
+        }
+        name = name.replace(/[\p{Cc}\\/:*?"<>|]/gu, '_').trim();
+        return name && /\.zip$/i.test(name) ? name.slice(0, 150) : '';
+    }
+
+    // Read the archive stream with a progress callback
+    async function readBody(resp, onProgress) {
+        if (!resp.body || typeof resp.body.getReader !== 'function') return resp.blob();
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        let lastUpdate = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.byteLength;
+            const now = Date.now();
+            if (now - lastUpdate >= 250) {
+                lastUpdate = now;
+                onProgress(received);
+            }
+        }
+        return new Blob(chunks, { type: 'application/zip' });
+    }
+
+    function resetDownloadButton() {
+        const btn = $('downloadBtn');
+        btn.innerHTML = DOWNLOAD_BUTTON_HTML;
+        btn.disabled = status?.exportAvailable === false;
+    }
+
+    async function downloadArchive() {
+        if (downloading || status?.exportAvailable === false) return;
+        downloading = true;
+        const btn = $('downloadBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 正在打包数据...';
+        showMsg('正在打包您的数据，数据较多时可能需要几分钟，请勿关闭页面', 'info');
+        try {
+            const resp = await fetch('/api/stc/qrole-export/archive', { cache: 'no-store' });
+            if (resp.status === 401) return sessionExpired();
+            if (!resp.ok) {
+                const data = await readJson(resp);
+                let error = typeof data.error === 'string' && data.error ? data.error : '';
+                if (!error) {
+                    if (resp.status === 409) error = '已有一个数据打包任务正在进行，请稍后再试';
+                    else if (resp.status === 429) error = '下载次数过多，请稍后再试';
+                    else if (resp.status === 403) error = '请求被拒绝，请刷新页面后重试';
+                    else error = '数据打包失败（HTTP ' + resp.status + '），请稍后重试';
+                }
+                showMsg(error, 'error');
+                return;
+            }
+
+            const blob = await readBody(resp, (received) => {
+                btn.textContent = '';
+                const icon = document.createElement('i');
+                icon.className = 'fa-solid fa-spinner fa-spin';
+                btn.append(icon, ' 正在下载 ' + formatBytes(received));
+            });
+            const fileName = fileNameFromDisposition(resp.headers.get('Content-Disposition'))
+                || ((shortText(status?.handle, 64).replace(/[^\w.-]/g, '_') || 'sillytavern') + '-data.zip');
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            showMsg('下载完成（' + formatBytes(blob.size) + '），请妥善保存 ZIP 文件', 'success');
+        } catch {
+            showMsg('下载失败，请检查网络后重试', 'error');
+        } finally {
+            downloading = false;
+            resetDownloadButton();
+        }
+    }
+
+    async function logout() {
+        const btn = $('logoutBtn');
+        btn.disabled = true;
+        try {
+            const token = await getCsrfToken();
+            await fetch('/api/stc/qrole-export/logout', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+                body: '{}',
+            });
+        } catch {
+            // Leave anyway: the export session also expires on its own
+        }
+        location.replace('/login');
+    }
+
+    $('retryLoad').addEventListener('click', (e) => {
+        e.preventDefault();
+        loadStatus();
+    });
+    $('downloadBtn').addEventListener('click', downloadArchive);
+    $('logoutBtn').addEventListener('click', logout);
+
+    loadStatus();
+})();
+
+/* ── Sakura particles ── */
+(function() {
+    const c = document.getElementById('stc-sakura');
+    if (!SITE.background.sakura) {
+        c.style.display = 'none';
+        return;
+    }
+    const ctx = c.getContext('2d');
+    const colors = ['#ffb7c5','#ffc8d4','#e8c4f8','#c4d8ff','#ffd8f0','#e0b8ff'];
+    const petals = [];
+    function resize() { c.width = innerWidth; c.height = innerHeight; }
+    resize(); window.addEventListener('resize', resize);
+    for (let i = 0; i < 36; i++) {
+        petals.push({
+            x: Math.random() * c.width, y: Math.random() * c.height,
+            r: Math.random() * 5.5 + 2,
+            vx: (Math.random() - .5) * .9, vy: Math.random() * 1.1 + .35,
+            rot: Math.random() * Math.PI * 2, vr: (Math.random() - .5) * .04,
+            a: Math.random() * .42 + .1,
+            color: colors[Math.floor(Math.random() * colors.length)],
+        });
+    }
+    function drawPetal(p) {
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.globalAlpha = p.a;
+        ctx.beginPath();
+        ctx.moveTo(0, -p.r);
+        ctx.bezierCurveTo(p.r*.8, -p.r*.8, p.r, p.r*.5, 0, p.r);
+        ctx.bezierCurveTo(-p.r, p.r*.5, -p.r*.8, -p.r*.8, 0, -p.r);
+        ctx.fillStyle = p.color; ctx.fill(); ctx.restore();
+    }
+    function animate() {
+        ctx.clearRect(0, 0, c.width, c.height);
+        petals.forEach(p => {
+            drawPetal(p); p.x += p.vx; p.y += p.vy; p.rot += p.vr;
+            p.vx += (Math.random() - .5) * .015;
+            p.vx = Math.max(-1.5, Math.min(1.5, p.vx));
+            if (p.y > c.height + 12) { p.y = -12; p.x = Math.random() * c.width; }
+        });
+        requestAnimationFrame(animate);
+    }
+    animate();
+})();
+</script>
+</body>
+</html>

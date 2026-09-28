@@ -40,10 +40,11 @@ function getHeaders() {
     return h;
 }
 
+/** HTML-escape text for element content AND quoted attribute values (quotes included). */
 function esc(s) {
     const d = document.createElement('div');
     d.textContent = String(s ?? '');
-    return d.innerHTML;
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function copyText(text) {
@@ -186,6 +187,7 @@ export function buildAdminPanelHTML() {
         ['template', 'fa-copy', '默认模板'],
         ['storage', 'fa-database', '用户空间'],
         ['users', 'fa-users-gear', '用户管理'],
+        ['qrole', 'fa-crown', 'QRole 会员'],
         ['tasks', 'fa-clock', '定时任务'],
       ].map(([id, icon, label]) =>
         `<button class="stc-tab-btn" data-tab="${id}" style="padding:8px 14px;border:none;border-radius:8px 8px 0 0;cursor:pointer;font-size:0.85em;background:rgba(255,255,255,.04);color:#aaa;transition:all .2s">
@@ -254,6 +256,7 @@ async function switchTab(tab) {
         case 'template': await renderTemplateTab(content); break;
         case 'storage': await renderStorageTab(content); break;
         case 'users': await renderUsersTab(content); break;
+        case 'qrole': await renderQroleTab(content); break;
         case 'tasks': await renderTasksTab(content); break;
     }
 }
@@ -965,8 +968,27 @@ const QROLE_DEFAULTS = {
     tierClaims: ['membershipTierId', 'membership_tier', 'membership.tierId', 'membership.tier', 'tier'],
     expiryClaims: ['membershipExpiresAt', 'membership_expires_at', 'membership.expiresAt'],
     reverifyHours: 24,
+    // Membership expiry lifecycle (mirror the code defaults of the server)
+    backgroundReverify: true,
+    renewUrl: 'https://www.qqy.one/membership',
+    expiryReminderDays: 7,
+    expiredDataExport: true,
+    expiredCleanup: { enabled: false, afterDays: 90 },
 };
 const QROLE_REVERIFY_MAX_HOURS = 8760;
+const QROLE_REMINDER_MAX_DAYS = 60;
+const QROLE_CLEANUP_MIN_DAYS = 30;
+const QROLE_CLEANUP_MAX_DAYS = 3650;
+
+/** Whether a string is an absolute http(s) URL. */
+function isHttpUrl(value) {
+    try {
+        const url = new URL(String(value ?? '').trim());
+        return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch {
+        return false;
+    }
+}
 
 /** Config list (array or comma-separated string) → text for an input. */
 function listToText(value, fallback = []) {
@@ -1056,6 +1078,19 @@ async function renderOAuthTab(container) {
         <div class="stc-form-row"><label>会员状态复核间隔（小时）:</label>
           <input class="stc-oauth-reverify" data-provider="qrole" type="number" min="0" max="${QROLE_REVERIFY_MAX_HOURS}" step="1" placeholder="${QROLE_DEFAULTS.reverifyHours}"></div>
         <div class="stc-oauth-hint">超过该时长需重新使用 QRole 登录以确认会员状态；0 = 仅按已知到期时间和等级判断</div>
+        <div class="stc-oauth-subtitle"><i class="fa-solid fa-hourglass-half"></i> 会员到期处理</div>
+        <label class="stc-oauth-check">
+          <input class="stc-oauth-bgreverify" data-provider="qrole" type="checkbox"> 后台自动复核会员（保存 QRole 刷新令牌）</label>
+        <div class="stc-oauth-hint">登录时加密保存 QRole 刷新令牌（30 天有效），会员到期或需复核时由服务器自动向 QRole 确认，续费用户无需重新登录。关闭后，已保存的令牌在用户下次登录时删除。</div>
+        <div class="stc-form-row"><label>续费链接:</label>
+          <input class="stc-oauth-renewurl" data-provider="qrole" type="text" placeholder="${QROLE_DEFAULTS.renewUrl}"></div>
+        <div class="stc-oauth-hint">到期提醒与数据导出页中「去续费」按钮打开的地址，仅支持 http(s)；留空使用默认地址。</div>
+        <div class="stc-form-row"><label>到期提醒提前天数:</label>
+          <input class="stc-oauth-reminderdays" data-provider="qrole" type="number" min="0" max="${QROLE_REMINDER_MAX_DAYS}" step="1" placeholder="${QROLE_DEFAULTS.expiryReminderDays}"></div>
+        <div class="stc-oauth-hint">会员到期前 N 天在页面顶部提醒用户续费（0-${QROLE_REMINDER_MAX_DAYS}）；0 = 不提醒。</div>
+        <label class="stc-oauth-check">
+          <input class="stc-oauth-expiredexport" data-provider="qrole" type="checkbox"> 会员过期后允许导出数据</label>
+        <div class="stc-oauth-hint">已有账号会员过期（或不是会员）时，QRole 登录后进入仅可续费 / 下载数据（ZIP）的页面；下载需官方 backups.allowFullDataBackup 开启。过期账号列表与自动清理见「QRole 会员」标签页。</div>
         <details class="stc-oauth-advanced">
           <summary>高级：会员字段映射</summary>
           <div class="stc-form-row"><label>等级字段:</label>
@@ -1082,6 +1117,7 @@ async function renderOAuthTab(container) {
         .stc-oauth-check { display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;font-size:.85em;color:#ccc }
         .stc-oauth-hint { font-size:.78em;color:#888;margin:-4px 0 10px;line-height:1.5 }
         .stc-oauth-advanced { margin-bottom:10px;font-size:.9em }
+        .stc-oauth-subtitle { font-size:.85em;font-weight:600;color:#ffc440;margin:16px 0 10px;padding-top:12px;border-top:1px dashed rgba(255,255,255,.08);display:flex;align-items:center;gap:6px }
         .stc-oauth-advanced summary { cursor:pointer;color:#aaa;font-size:.85em;margin-bottom:10px }
 
         /* Mobile responsive styles */
@@ -1136,6 +1172,13 @@ async function renderOAuthTab(container) {
     setValue('stc-oauth-tierclaims', 'qrole', listToText(qroleCfg.tierClaims, QROLE_DEFAULTS.tierClaims));
     setValue('stc-oauth-expiryclaims', 'qrole', listToText(qroleCfg.expiryClaims, QROLE_DEFAULTS.expiryClaims));
     setValue('stc-oauth-reverify', 'qrole', Number.isInteger(qroleCfg.reverifyHours) ? qroleCfg.reverifyHours : QROLE_DEFAULTS.reverifyHours);
+    setChecked('stc-oauth-bgreverify', 'qrole', qroleCfg.backgroundReverify !== false);
+    setValue('stc-oauth-renewurl', 'qrole', typeof qroleCfg.renewUrl === 'string' && qroleCfg.renewUrl ? qroleCfg.renewUrl : QROLE_DEFAULTS.renewUrl);
+    // Like the lists: the renew URL is only sent when edited. The server reports the effective URL,
+    // so saving it untouched would turn a blank / missing renewUrl into a pinned default.
+    let loadedRenewUrl = field('stc-oauth-renewurl', 'qrole')?.value?.trim() ?? '';
+    setValue('stc-oauth-reminderdays', 'qrole', Number.isInteger(qroleCfg.expiryReminderDays) ? qroleCfg.expiryReminderDays : QROLE_DEFAULTS.expiryReminderDays);
+    setChecked('stc-oauth-expiredexport', 'qrole', qroleCfg.expiredDataExport !== false);
 
     // List fields are only sent when edited: an untouched list may be unset in config.yaml
     // (built-in defaults apply), and saving it would pin today's defaults into the file.
@@ -1187,6 +1230,28 @@ async function renderOAuthTab(container) {
                     return;
                 }
                 data.reverifyHours = reverifyHours;
+
+                // Membership expiry lifecycle (expiredCleanup is saved from the 「QRole 会员」 tab)
+                data.backgroundReverify = !!field('stc-oauth-bgreverify', provider)?.checked;
+                data.expiredDataExport = !!field('stc-oauth-expiredexport', provider)?.checked;
+                const renewUrl = row('stc-oauth-renewurl') ?? '';
+                if (renewUrl !== loadedRenewUrl) {
+                    // Blank = the default QRole membership page
+                    if (renewUrl && !isHttpUrl(renewUrl)) {
+                        toast('续费链接必须是 http(s) 地址', true);
+                        return;
+                    }
+                    data.renewUrl = renewUrl;
+                }
+                const reminderText = row('stc-oauth-reminderdays');
+                const reminderDays = reminderText
+                    ? Number(reminderText)
+                    : (field('stc-oauth-reminderdays', provider)?.validity?.badInput ? NaN : QROLE_DEFAULTS.expiryReminderDays);
+                if (!Number.isInteger(reminderDays) || reminderDays < 0 || reminderDays > QROLE_REMINDER_MAX_DAYS) {
+                    toast(`到期提醒提前天数需为 0-${QROLE_REMINDER_MAX_DAYS} 之间的整数`, true);
+                    return;
+                }
+                data.expiryReminderDays = reminderDays;
             }
             btn.disabled = true;
             try {
@@ -1200,6 +1265,7 @@ async function renderOAuthTab(container) {
                     for (const [key, cls] of Object.entries(QROLE_LIST_INPUTS)) {
                         if (data[key]) loadedQroleLists[key] = row(cls) ?? '';
                     }
+                    if (data.renewUrl !== undefined) loadedRenewUrl = data.renewUrl;
                 }
                 toast('已保存，立即生效');
             } catch (e) { toast('保存失败: ' + e.message, true); }
@@ -2043,6 +2109,836 @@ async function deleteInactiveUsers() {
     finally {
         if (btn) { btn.disabled = false; btn.innerHTML = btn._orig; }
     }
+}
+
+// ═══════════════════════════════════════════════════
+// TAB: QRole 会员（过期账号管理 + 自动清理）
+// ═══════════════════════════════════════════════════
+const QROLE_ACCOUNTS_PER_PAGE = 30;
+const QROLE_EXPIRING_DAYS = 7;
+const DAY_MS = 86400000;
+const QROLE_STATE_LABELS = {
+    active: ['有效', '#27ae60'],
+    expired: ['已过期', '#e74c3c'],
+    not_member: ['非会员', '#e67e22'],
+};
+const QROLE_FILTERS = [
+    ['all', '全部'],
+    ['expired', '已过期'],
+    ['expiring', `${QROLE_EXPIRING_DAYS} 天内到期`],
+    ['active', '有效'],
+];
+const QROLE_VERIFY_MESSAGES = {
+    no_token: '该账号没有可用的刷新令牌，无法后台复核（需用户重新使用 QRole 登录）',
+    transient: '暂时无法连接 QRole，请稍后重试',
+    definitive: 'QRole 拒绝了该账号的刷新令牌（已过期、被撤销或账号异常），令牌已删除',
+};
+// Why a cleanup run kept an account (skipped[].reason of the run result)
+const QROLE_CLEANUP_SKIP_LABELS = {
+    gone: '账号已不存在',
+    renewed: '已续费',
+    not_due: '未到清理时间',
+    verify_transient: '暂时无法连接 QRole，顺延到下次',
+    verify_deferred: '本次复核次数已达上限，顺延到下次',
+    verify_unavailable: '无法复核（令牌密钥不可用或已关闭后台复核），未删除',
+    verify_client_rejected: 'QRole 拒绝了本站的客户端凭据，未删除（请检查 OAuth 配置）',
+    cleanup_disabled: '清理已被关闭，未删除',
+};
+// Verify reasons with a more specific message than QROLE_VERIFY_MESSAGES[result]
+const QROLE_VERIFY_REASON_MESSAGES = {
+    invalid_client: 'QRole 拒绝了本站的客户端凭据（invalid_client），请检查「OAuth 配置」中 QRole 的 Client ID、Client Secret 与令牌认证方式；已保存的刷新令牌不受影响',
+};
+// Background cleanup run: poll GET .../cleanup/status until the run has finished
+const QROLE_CLEANUP_POLL_MS = 3000;
+const QROLE_CLEANUP_POLL_MAX_MS = 30 * 60 * 1000;
+
+let _qroleAccounts = [];
+let _qroleCleanup = {};
+let _qroleClockOffset = 0;
+let _qroleFilter = 'all';
+let _qroleSearch = '';
+let _qrolePage = 1;
+const _qroleSelected = new Set();
+
+/** Server-adjusted current time (the account list carries the server's `now`). */
+function qroleNow() {
+    return Date.now() + _qroleClockOffset;
+}
+
+/** ms number, seconds number or ISO string → ms (null when missing/invalid). */
+function toMs(value) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        return value < 1e12 ? value * 1000 : value;
+    }
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+}
+
+function pad2(n) {
+    return String(n).padStart(2, '0');
+}
+
+/** Local `YYYY-MM-DD`. */
+function fmtDate(ms) {
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Local `YYYY-MM-DD HH:mm`. */
+function fmtDateTime(ms) {
+    const d = new Date(ms);
+    return `${fmtDate(ms)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** Byte count → human readable size ('未知' when unknown). */
+function fmtBytes(bytes) {
+    const n = Number(bytes);
+    if (bytes === null || bytes === undefined || !Number.isFinite(n) || n < 0) return '未知';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+function fmtRelativePast(ms) {
+    if (!ms) return '从未';
+    const diff = qroleNow() - ms;
+    if (diff < 60000) return '刚刚';
+    const days = Math.floor(diff / DAY_MS);
+    if (days > 0) return `${days}天前`;
+    const hours = Math.floor(diff / 3600000);
+    if (hours > 0) return `${hours}小时前`;
+    return `${Math.floor(diff / 60000)}分钟前`;
+}
+
+function qroleStateLabel(state) {
+    return Object.hasOwn(QROLE_STATE_LABELS, state) ? QROLE_STATE_LABELS[state][0] : '未知';
+}
+
+function isQroleExpiringSoon(account) {
+    if (account.state !== 'active') return false;
+    const expiresAt = toMs(account.expiresAt);
+    const now = qroleNow();
+    return expiresAt !== null && expiresAt > now && expiresAt - now <= QROLE_EXPIRING_DAYS * DAY_MS;
+}
+
+function qroleMatchesFilter(account, filter) {
+    switch (filter) {
+        case 'expired': return account.state !== 'active';
+        case 'expiring': return isQroleExpiringSoon(account);
+        case 'active': return account.state === 'active';
+        default: return true;
+    }
+}
+
+/** Non-active accounts first (longest expired first), then active ones by expiry (soonest first). */
+function compareQroleAccounts(a, b) {
+    const aActive = a.state === 'active';
+    const bActive = b.state === 'active';
+    if (aActive !== bActive) return aActive ? 1 : -1;
+    const key = aActive ? 'expiresAt' : 'expiredSince';
+    const aTime = toMs(a[key]) ?? Infinity;
+    const bTime = toMs(b[key]) ?? Infinity;
+    if (aTime !== bTime) return aTime < bTime ? -1 : 1;
+    return String(a.handle).localeCompare(String(b.handle));
+}
+
+/** Result code of a verification (`'ok'`, `{ result: 'ok' }`...). */
+function qroleResultCode(value) {
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object') {
+        for (const key of ['result', 'outcome', 'code']) {
+            if (typeof value[key] === 'string') return value[key];
+        }
+    }
+    return '';
+}
+
+/** `handle（detail）` list of result items, at most 10 (escaped HTML). */
+function describeQroleResultItems(items, detail) {
+    const texts = items
+        .filter(item => item && typeof item.handle === 'string')
+        .map(item => {
+            const extra = detail(item);
+            return esc(item.handle) + (extra ? `（${esc(extra)}）` : '');
+        });
+    return texts.slice(0, 10).join('、') + (texts.length > 10 ? ` 等 ${texts.length} 个` : '');
+}
+
+/**
+ * One-line summary of a cleanup run result (escaped HTML): the result of POST .../cleanup/run
+ * and `cleanup.lastResult` of the account list share the shape
+ * `{ candidates, deletedCount, skippedCount, failedCount, remaining, deleted[], skipped[], failed[], error? }`.
+ */
+function describeQroleCleanupResult(result) {
+    if (!result || typeof result !== 'object') return '无';
+    const deleted = Array.isArray(result.deleted) ? result.deleted : [];
+    const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+    const failed = Array.isArray(result.failed) ? result.failed : [];
+    const count = (value, list) => (Number.isFinite(value) ? value : list.length);
+    const parts = [];
+    if (Number.isFinite(result.candidates)) parts.push(`到期账号 ${result.candidates} 个`);
+    parts.push(`删除 ${count(result.deletedCount, deleted)} 个`);
+    parts.push(`跳过 ${count(result.skippedCount, skipped)} 个`);
+    const failedCount = count(result.failedCount, failed);
+    if (failedCount) parts.push(`<span style="color:#e74c3c">失败 ${failedCount} 个</span>`);
+    if (Number.isFinite(result.remaining) && result.remaining > 0) parts.push(`${result.remaining} 个顺延到下次运行`);
+    if (result.stopped === 'disabled') parts.push('<span style="color:#f39c12">运行中清理被关闭，任务已提前结束</span>');
+    if (typeof result.error === 'string' && result.error) parts.push(`<span style="color:#e74c3c">错误：${esc(result.error)}</span>`);
+    if (deleted.length) parts.push(`已删除：${describeQroleResultItems(deleted, () => '')}`);
+    if (skipped.length) {
+        parts.push(`已跳过：${describeQroleResultItems(skipped, item => (Object.hasOwn(QROLE_CLEANUP_SKIP_LABELS, item.reason) ? QROLE_CLEANUP_SKIP_LABELS[item.reason] : String(item.reason ?? '')))}`);
+    }
+    if (failed.length) {
+        parts.push(`<span style="color:#e74c3c">失败：${describeQroleResultItems(failed, item => String(item.error ?? ''))}</span>`);
+    }
+    return parts.join('，');
+}
+
+async function renderQroleTab(container) {
+    const input = 'padding:7px 10px;border-radius:6px;border:1px solid #333;background:#0f3460;color:#eee';
+    container.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+        <h3 style="margin:0"><i class="fa-solid fa-crown" style="color:#ffc440;margin-right:6px"></i>QRole 会员账号</h3>
+        <button id="stc-qa-refresh" class="menu_button" style="height:36px;padding:0 18px;font-size:.85em;white-space:nowrap;display:flex;align-items:center;gap:6px;color:#fff">
+          <i class="fa-solid fa-rotate-right"></i> 刷新</button>
+      </div>
+      <div id="stc-qa-notice"></div>
+      <div style="font-size:.8em;color:#aaa;margin-bottom:12px;padding:8px 10px;background:rgba(255,255,255,.04);border-radius:6px;border-left:2px solid #ffc440;line-height:1.6">
+        <i class="fa-solid fa-circle-info" style="margin-right:4px"></i>
+        仅列出通过 QRole 登录创建的账号（不含管理员）。「已过期」包含会员已到期和当前不是会员的账号；有刷新令牌的账号可「立即复核」向 QRole 确认最新会员状态。
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        ${QROLE_FILTERS.map(([id, label]) => `
+        <button class="stc-qa-filter menu_button" data-filter="${id}" style="padding:6px 12px;font-size:.82em;white-space:nowrap;color:#fff">
+          ${label} <span class="stc-qa-count" data-filter="${id}" style="opacity:.7"></span></button>`).join('')}
+        <input id="stc-qa-search" type="text" placeholder="搜索用户名..." style="flex:1;min-width:140px;${input};font-size:.85em">
+      </div>
+      <div id="stc-qa-batch-bar" style="display:none;align-items:center;gap:10px;padding:8px 12px;background:rgba(108,99,255,.15);border:1px solid rgba(108,99,255,.4);border-radius:8px;margin-bottom:10px;flex-wrap:wrap">
+        <span style="font-size:.85em;color:#ccc"><i class="fa-solid fa-check-square" style="color:#6c63ff;margin-right:4px"></i>已选 <strong id="stc-qa-selected-count" style="color:#fff">0</strong> 个账号，合计 <strong id="stc-qa-selected-size" style="color:#fff"></strong></span>
+        <button id="stc-qa-batch-delete" class="menu_button" style="padding:5px 14px;font-size:.82em;background:#c0392b;color:#fff;white-space:nowrap">
+          <i class="fa-solid fa-trash-can"></i> 批量删除所选</button>
+        <button id="stc-qa-batch-clear" class="menu_button" style="padding:5px 14px;font-size:.82em;color:#fff;white-space:nowrap">
+          <i class="fa-solid fa-xmark"></i> 取消选择</button>
+      </div>
+      <div id="stc-qa-list" style="margin-bottom:28px">
+        <div style="text-align:center;padding:24px;color:#888"><i class="fa-solid fa-spinner fa-spin"></i> 加载中...</div>
+      </div>
+
+      <!-- Automatic cleanup -->
+      <div style="border-top:1px solid #2a3a5e;padding-top:20px">
+        <h3 style="margin:0 0 14px"><i class="fa-solid fa-broom" style="color:#e74c3c;margin-right:6px"></i>自动清理过期 QRole 账号</h3>
+        <div style="background:rgba(231,76,60,.08);border:1px solid rgba(231,76,60,.3);border-radius:8px;padding:12px;margin-bottom:14px;font-size:.85em;color:#e88;line-height:1.6">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <strong>删除不可恢复！</strong>开启后，服务器每天检查一次，彻底删除超过保留期限的过期 / 非会员 QRole 账号及其全部数据（每次最多 20 个）。
+          有刷新令牌的账号会在删除前先向 QRole 复核，已续费的账号不会被删除。
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;font-size:.9em">
+          <input id="stc-qa-cleanup-enabled" type="checkbox"> 启用自动清理</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+          <span style="font-size:.85em;color:#aaa">过期后保留天数:</span>
+          <input id="stc-qa-cleanup-days" type="number" min="${QROLE_CLEANUP_MIN_DAYS}" max="${QROLE_CLEANUP_MAX_DAYS}" step="1"
+            placeholder="${QROLE_DEFAULTS.expiredCleanup.afterDays}" style="${input};width:100px">
+          <span style="font-size:.85em;color:#888">天（${QROLE_CLEANUP_MIN_DAYS}-${QROLE_CLEANUP_MAX_DAYS}）</span>
+        </div>
+        <div style="font-size:.78em;color:#888;margin-bottom:14px;line-height:1.6">
+          计划清理时间 = 会员到期（或被判定为非会员）时间、最后活跃时间、最后登录时间三者中最晚者 + 保留天数。
+          仅在 QRole 配置开启「仅允许会员登录」时运行。
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-bottom:12px">
+          <button id="stc-qa-cleanup-save" class="menu_button" style="padding:9px 18px;font-size:.85em;background:#27ae60;white-space:nowrap;color:#fff">
+            <i class="fa-solid fa-save"></i> 保存清理设置</button>
+          <button id="stc-qa-cleanup-preview" class="menu_button" style="padding:9px 18px;font-size:.85em;white-space:nowrap;color:#fff">
+            <i class="fa-solid fa-magnifying-glass"></i> 预览将被清理的账号</button>
+          <button id="stc-qa-cleanup-run" class="menu_button" style="padding:9px 18px;font-size:.85em;background:#c0392b;white-space:nowrap;color:#fff">
+            <i class="fa-solid fa-trash-can"></i> 立即执行清理</button>
+        </div>
+        <div id="stc-qa-cleanup-last" style="font-size:.82em;color:#888;margin-bottom:10px"></div>
+        <div id="stc-qa-cleanup-result" style="display:none"></div>
+      </div>`;
+
+    container.querySelector('#stc-qa-refresh')?.addEventListener('click', () => loadQroleAccounts());
+    container.querySelectorAll('.stc-qa-filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+            _qroleFilter = btn.dataset.filter;
+            _qrolePage = 1;
+            renderQroleAccounts();
+        });
+    });
+    const search = container.querySelector('#stc-qa-search');
+    if (search) {
+        search.value = _qroleSearch;
+        search.addEventListener('input', () => {
+            _qroleSearch = search.value.trim();
+            _qrolePage = 1;
+            renderQroleAccounts();
+        });
+    }
+    container.querySelector('#stc-qa-batch-delete')?.addEventListener('click', deleteSelectedQroleAccounts);
+    container.querySelector('#stc-qa-batch-clear')?.addEventListener('click', () => {
+        _qroleSelected.clear();
+        renderQroleAccounts();
+    });
+    container.querySelector('#stc-qa-cleanup-save')?.addEventListener('click', saveQroleCleanupSettings);
+    container.querySelector('#stc-qa-cleanup-preview')?.addEventListener('click', previewQroleCleanup);
+    container.querySelector('#stc-qa-cleanup-run')?.addEventListener('click', runQroleCleanup);
+
+    await loadQroleAccounts({ syncCleanupForm: true });
+}
+
+/**
+ * GET /api/stc/qrole-accounts (+ the QRole config for notices).
+ * @param {{ syncCleanupForm?: boolean }} [options] Also fill the cleanup settings inputs
+ */
+async function loadQroleAccounts({ syncCleanupForm = false } = {}) {
+    const list = document.getElementById('stc-qa-list');
+    if (!list) return;
+    list.innerHTML = '<div style="text-align:center;padding:24px;color:#888"><i class="fa-solid fa-spinner fa-spin"></i> 加载中...</div>';
+
+    const configPromise = fetch('/api/stc/oauth-config/config', { headers: getHeaders() })
+        .then(r => (r.ok ? r.json() : null))
+        .catch(() => null);
+    try {
+        const r = await fetch('/api/stc/qrole-accounts', { headers: getHeaders(), cache: 'no-store' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+
+        _qroleAccounts = Array.isArray(d.accounts) ? d.accounts.filter(a => a && typeof a.handle === 'string') : [];
+        _qroleCleanup = d.cleanup && typeof d.cleanup === 'object' ? d.cleanup : {};
+        const serverNow = toMs(d.now);
+        _qroleClockOffset = serverNow !== null ? serverNow - Date.now() : 0;
+        // Drop selections of accounts that no longer exist
+        const handles = new Set(_qroleAccounts.map(a => a.handle));
+        for (const handle of [..._qroleSelected]) {
+            if (!handles.has(handle)) _qroleSelected.delete(handle);
+        }
+        if (syncCleanupForm) syncQroleCleanupForm();
+        renderQroleCleanupLastRun();
+        renderQroleAccounts();
+    } catch (e) {
+        list.innerHTML = `<div style="color:#e74c3c;text-align:center;padding:20px">加载失败: ${esc(e.message)}</div>`;
+    }
+
+    const config = await configPromise;
+    const notice = document.getElementById('stc-qa-notice');
+    if (notice && config?.qrole) {
+        const warnings = [];
+        if (config.qrole.enabled !== true) warnings.push('QRole 登录当前未启用。');
+        if (config.qrole.requireMembership === false) warnings.push('「仅允许会员登录」已关闭：会员状态不再限制登录，自动清理不会运行。');
+        notice.innerHTML = warnings.length
+            ? `<div style="background:rgba(243,156,18,.08);border:1px solid rgba(243,156,18,.3);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:.82em;color:#f5d76e">
+                <i class="fa-solid fa-triangle-exclamation"></i> ${warnings.map(esc).join(' ')}</div>`
+            : '';
+    }
+}
+
+function syncQroleCleanupForm() {
+    const enabled = document.getElementById('stc-qa-cleanup-enabled');
+    const days = document.getElementById('stc-qa-cleanup-days');
+    if (enabled) enabled.checked = _qroleCleanup.enabled === true;
+    if (days) {
+        days.value = Number.isInteger(_qroleCleanup.afterDays)
+            ? _qroleCleanup.afterDays
+            : QROLE_DEFAULTS.expiredCleanup.afterDays;
+    }
+}
+
+function renderQroleCleanupLastRun() {
+    const el = document.getElementById('stc-qa-cleanup-last');
+    if (!el) return;
+    const lastRunAt = toMs(_qroleCleanup.lastRunAt);
+    const status = _qroleCleanup.enabled === true
+        ? '<span style="color:#27ae60">已启用</span>'
+        : '<span style="color:#888">未启用</span>';
+    el.innerHTML = `<i class="fa-solid fa-info-circle"></i> 自动清理：${status} · 上次运行：<span style="color:#aaa">${lastRunAt !== null ? fmtDateTime(lastRunAt) : '从未运行'}</span>`
+        + (lastRunAt !== null && _qroleCleanup.lastResult !== undefined && _qroleCleanup.lastResult !== null
+            ? ` · 结果：<span style="color:#aaa">${describeQroleCleanupResult(_qroleCleanup.lastResult)}</span>`
+            : '')
+        + (_qroleCleanup.running === true ? ' · <span style="color:#f39c12"><i class="fa-solid fa-spinner fa-spin"></i> 清理正在运行</span>' : '');
+}
+
+function renderQroleAccounts() {
+    const list = document.getElementById('stc-qa-list');
+    if (!list) return;
+
+    // Filter buttons: counts + active state
+    document.querySelectorAll('.stc-qa-count').forEach(el => {
+        el.textContent = `(${_qroleAccounts.filter(a => qroleMatchesFilter(a, el.dataset.filter)).length})`;
+    });
+    document.querySelectorAll('.stc-qa-filter').forEach(btn => {
+        btn.style.background = btn.dataset.filter === _qroleFilter ? '#6c63ff' : '';
+    });
+
+    const term = _qroleSearch.toLowerCase();
+    const filtered = _qroleAccounts
+        .filter(a => qroleMatchesFilter(a, _qroleFilter))
+        .filter(a => !term || a.handle.toLowerCase().includes(term) || String(a.name ?? '').toLowerCase().includes(term))
+        .sort(compareQroleAccounts);
+
+    updateQroleBatchBar();
+
+    if (!filtered.length) {
+        list.innerHTML = emptyState('fa-crown', _qroleAccounts.length ? '没有符合条件的账号' : '暂无 QRole 账号', _qroleAccounts.length ? '请更换筛选条件' : '还没有通过 QRole 登录的用户');
+        return;
+    }
+
+    const totalPages = Math.ceil(filtered.length / QROLE_ACCOUNTS_PER_PAGE);
+    if (_qrolePage > totalPages) _qrolePage = totalPages;
+    const start = (_qrolePage - 1) * QROLE_ACCOUNTS_PER_PAGE;
+    const page = filtered.slice(start, start + QROLE_ACCOUNTS_PER_PAGE);
+    const pager = createPagination(_qrolePage, totalPages, 'stc-qa-page-btn');
+    const now = qroleNow();
+    const cell = 'padding:8px 10px';
+
+    const rows = page.map(a => {
+        const handle = esc(a.handle);
+        const name = typeof a.name === 'string' && a.name && a.name !== a.handle
+            ? `<div style="font-size:.85em;color:#888;font-weight:400">${esc(a.name)}</div>` : '';
+        const tierTitle = [
+            typeof a.tierName === 'string' ? a.tierName.trim() : '',
+            a.tierAllowed === false ? '该等级不在允许登录的等级列表中' : '',
+        ].filter(Boolean).join(' · ');
+        const tier = typeof a.tier === 'string' && a.tier.trim()
+            ? `<span style="color:${a.tierAllowed === false ? '#888' : '#ffc440'}" title="${esc(tierTitle)}">${esc(a.tier.trim().toUpperCase())}</span>`
+            : '<span style="color:#666">—</span>';
+        const [stateText, stateColor] = Object.hasOwn(QROLE_STATE_LABELS, a.state) ? QROLE_STATE_LABELS[a.state] : ['未知', '#888'];
+        const badge = (text, color) => `<span style="color:${color};font-size:.85em;padding:2px 6px;background:${color}33;border-radius:4px;white-space:nowrap">${text}</span>`;
+        const badges = badge(stateText, stateColor)
+            + (isQroleExpiringSoon(a) ? ` ${badge('即将到期', '#f39c12')}` : '')
+            + (a.enabled === false ? ` ${badge('已停用', '#888')}` : '');
+
+        const expiresAt = toMs(a.expiresAt);
+        const expiry = expiresAt !== null
+            ? `<span title="${fmtDateTime(expiresAt)}">${fmtDate(expiresAt)}</span>`
+            : `<span style="color:#666">${a.state === 'active' ? '无期限' : '—'}</span>`;
+
+        const expiredSince = toMs(a.expiredSince);
+        const expiredDays = a.state !== 'active' && expiredSince !== null
+            ? `<span style="color:#e74c3c">${Math.max(0, Math.floor((now - expiredSince) / DAY_MS))} 天</span>`
+            : '<span style="color:#666">—</span>';
+
+        const lastActive = toMs(a.lastActiveAt) ?? toMs(a.lastLoginAt);
+        const activity = lastActive !== null
+            ? `<span title="${fmtDateTime(lastActive)}">${fmtRelativePast(lastActive)}</span>`
+            : '<span style="color:#666">从未</span>';
+
+        const tokenExpiresAt = toMs(a.refreshTokenExpiresAt);
+        let token;
+        if (a.hasRefreshToken !== true) {
+            token = '<span style="color:#888">无令牌</span>';
+        } else if (tokenExpiresAt !== null && tokenExpiresAt <= now) {
+            token = `<span style="color:#e67e22" title="令牌已于 ${fmtDateTime(tokenExpiresAt)} 过期">令牌已过期</span>`;
+        } else {
+            token = `<span style="color:#27ae60"><i class="fa-solid fa-key"></i> 有令牌</span>${tokenExpiresAt !== null
+                ? `<div style="font-size:.85em;color:#888">至 ${fmtDate(tokenExpiresAt)}</div>` : ''}`;
+        }
+
+        const cleanupAt = toMs(a.cleanupAt);
+        const cleanup = cleanupAt === null
+            ? '<span style="color:#666">—</span>'
+            : cleanupAt <= now
+                ? `<span style="color:#e74c3c" title="${fmtDateTime(cleanupAt)}">已到期（下次运行）</span>`
+                : `<span style="color:#f39c12" title="${fmtDateTime(cleanupAt)}">${fmtDate(cleanupAt)}</span>`;
+
+        const checked = _qroleSelected.has(a.handle);
+        const canVerify = a.hasRefreshToken === true && (tokenExpiresAt === null || tokenExpiresAt > now);
+        return `<tr style="border-bottom:1px solid rgba(255,255,255,.04);background:${checked ? 'rgba(108,99,255,.15)' : ''}">
+            <td style="${cell};text-align:center;width:36px">
+              <input type="checkbox" class="stc-qa-check" data-handle="${handle}" ${checked ? 'checked' : ''} style="width:15px;height:15px;cursor:pointer;accent-color:#6c63ff"></td>
+            <td style="${cell};font-weight:600">${handle}${name}</td>
+            <td style="${cell}">${tier}</td>
+            <td style="${cell}">${badges}</td>
+            <td style="${cell};white-space:nowrap">${expiry}</td>
+            <td style="${cell};text-align:right;white-space:nowrap">${expiredDays}</td>
+            <td style="${cell};text-align:center;white-space:nowrap">${activity}</td>
+            <td style="${cell};text-align:right;white-space:nowrap">${esc(fmtBytes(a.storageBytes))}</td>
+            <td style="${cell};white-space:nowrap">${token}</td>
+            <td style="${cell};white-space:nowrap">${cleanup}</td>
+            <td style="${cell};text-align:center;white-space:nowrap">
+              <button class="stc-qa-verify menu_button" data-handle="${handle}" ${canVerify ? '' : 'disabled'}
+                style="padding:3px 8px;font-size:.75em;margin-right:4px;color:#fff"
+                title="${canVerify ? '立即复核：使用刷新令牌向 QRole 确认会员状态' : '没有可用的刷新令牌，无法后台复核'}">
+                <i class="fa-solid fa-user-check"></i> 立即复核</button>
+              <button class="stc-qa-delete menu_button" data-handle="${handle}"
+                style="padding:3px 8px;font-size:.75em;background:#c0392b;color:#fff" title="删除账号及全部数据">
+                <i class="fa-solid fa-trash"></i> 删除</button>
+            </td>
+          </tr>`;
+    }).join('');
+
+    const pageHandles = page.map(a => a.handle);
+    const allChecked = pageHandles.length > 0 && pageHandles.every(h => _qroleSelected.has(h));
+    const th = 'padding:8px 10px;white-space:nowrap';
+    list.innerHTML = `
+        <div style="color:#888;font-size:.82em;margin-bottom:8px">
+          共 <strong style="color:#eee">${filtered.length}</strong> 个账号 · 显示 ${start + 1}–${Math.min(start + QROLE_ACCOUNTS_PER_PAGE, filtered.length)}
+        </div>
+        ${pager}
+        <div style="overflow-x:auto;margin-top:8px">
+        <table style="width:100%;border-collapse:collapse;font-size:.82em;min-width:980px">
+          <thead><tr style="color:#888;border-bottom:1px solid #2a3a5e">
+            <th style="${th};text-align:center;width:36px">
+              <input type="checkbox" id="stc-qa-select-all" title="全选/取消全选本页" ${allChecked ? 'checked' : ''} style="width:15px;height:15px;cursor:pointer;accent-color:#6c63ff"></th>
+            <th style="${th};text-align:left">用户名</th>
+            <th style="${th};text-align:left">等级</th>
+            <th style="${th};text-align:left">状态</th>
+            <th style="${th};text-align:left">到期时间</th>
+            <th style="${th};text-align:right">已过期天数</th>
+            <th style="${th};text-align:center">最后活跃</th>
+            <th style="${th};text-align:right">占用空间</th>
+            <th style="${th};text-align:left">自动复核</th>
+            <th style="${th};text-align:left">计划清理</th>
+            <th style="${th};text-align:center">操作</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>
+        ${pager}`;
+
+    list.querySelectorAll('.stc-qa-page-btn').forEach(b => {
+        b.addEventListener('click', () => {
+            _qrolePage = parseInt(b.dataset.page);
+            renderQroleAccounts();
+        });
+    });
+    list.querySelectorAll('.stc-qa-verify').forEach(btn => {
+        btn.addEventListener('click', () => verifyQroleAccount(btn.dataset.handle, btn));
+    });
+    list.querySelectorAll('.stc-qa-delete').forEach(btn => {
+        btn.addEventListener('click', () => deleteQroleAccount(btn.dataset.handle));
+    });
+    const selectAll = list.querySelector('#stc-qa-select-all');
+    if (selectAll) selectAll.indeterminate = !allChecked && pageHandles.some(h => _qroleSelected.has(h));
+    selectAll?.addEventListener('change', () => {
+        pageHandles.forEach(h => (selectAll.checked ? _qroleSelected.add(h) : _qroleSelected.delete(h)));
+        list.querySelectorAll('.stc-qa-check').forEach(cb => {
+            cb.checked = selectAll.checked;
+            const row = cb.closest('tr');
+            if (row) row.style.background = cb.checked ? 'rgba(108,99,255,.15)' : '';
+        });
+        updateQroleBatchBar();
+    });
+    list.querySelectorAll('.stc-qa-check').forEach(cb => {
+        cb.addEventListener('change', () => {
+            if (cb.checked) _qroleSelected.add(cb.dataset.handle);
+            else _qroleSelected.delete(cb.dataset.handle);
+            const row = cb.closest('tr');
+            if (row) row.style.background = cb.checked ? 'rgba(108,99,255,.15)' : '';
+            if (selectAll) {
+                selectAll.checked = pageHandles.every(h => _qroleSelected.has(h));
+                selectAll.indeterminate = !selectAll.checked && pageHandles.some(h => _qroleSelected.has(h));
+            }
+            updateQroleBatchBar();
+        });
+    });
+}
+
+/**
+ * Total storage of accounts (unknown sizes are counted separately).
+ * @param {object[]} accounts Account entries (or preview candidates)
+ * @returns {{ bytes: number, unknown: number }}
+ */
+function sumQroleStorage(accounts) {
+    let bytes = 0;
+    let unknown = 0;
+    for (const account of accounts) {
+        const value = account?.storageBytes;
+        const n = Number(value);
+        if (value !== null && value !== undefined && Number.isFinite(n) && n >= 0) bytes += n;
+        else unknown++;
+    }
+    return { bytes, unknown };
+}
+
+/** Account entries of the selected handles. */
+function selectedQroleAccounts() {
+    return [..._qroleSelected].map(handle => _qroleAccounts.find(a => a.handle === handle) ?? { handle });
+}
+
+function updateQroleBatchBar() {
+    const bar = document.getElementById('stc-qa-batch-bar');
+    if (!bar) return;
+    bar.style.display = _qroleSelected.size > 0 ? 'flex' : 'none';
+    const { bytes, unknown } = sumQroleStorage(selectedQroleAccounts());
+    const count = document.getElementById('stc-qa-selected-count');
+    const size = document.getElementById('stc-qa-selected-size');
+    if (count) count.textContent = String(_qroleSelected.size);
+    if (size) size.textContent = fmtBytes(bytes) + (unknown ? `（${unknown} 个未知）` : '');
+}
+
+async function verifyQroleAccount(handle, btn) {
+    if (!handle) return;
+    if (btn) {
+        btn.disabled = true;
+        btn._orig = btn.innerHTML;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 复核中';
+    }
+    try {
+        const r = await fetch('/api/stc/qrole-accounts/verify', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ handle }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+
+        // Updated entry: { account } / { entry } / the entry itself
+        const account = [d.account, d.entry, d.state ? d : null].find(a => a && typeof a === 'object' && a.handle === handle);
+        const code = qroleResultCode(d.result !== undefined ? d.result : d);
+        if (code === 'ok') {
+            const expiresAt = toMs(account?.expiresAt);
+            toast(`复核完成：${account ? qroleStateLabel(account.state) : '会员状态已更新'}${expiresAt !== null ? `，到期时间 ${fmtDateTime(expiresAt)}` : ''}`);
+        } else if (typeof d.reason === 'string' && Object.hasOwn(QROLE_VERIFY_REASON_MESSAGES, d.reason)) {
+            toast(QROLE_VERIFY_REASON_MESSAGES[d.reason], true);
+        } else {
+            toast(Object.hasOwn(QROLE_VERIFY_MESSAGES, code) ? QROLE_VERIFY_MESSAGES[code] : `复核结果：${code || '未知'}`, true);
+        }
+        if (account) {
+            _qroleAccounts = _qroleAccounts.map(a => (a.handle === handle ? account : a));
+            renderQroleAccounts();
+        } else {
+            await loadQroleAccounts();
+        }
+    } catch (e) {
+        toast('复核失败: ' + e.message, true);
+        if (btn?.isConnected) {
+            btn.disabled = false;
+            btn.innerHTML = btn._orig;
+        }
+    }
+}
+
+async function deleteQroleAccount(handle) {
+    const account = _qroleAccounts.find(a => a.handle === handle);
+    if (!account) return;
+    const expiredSince = toMs(account.expiredSince);
+    const stateText = qroleStateLabel(account.state)
+        + (account.state !== 'active' && expiredSince !== null ? `（${Math.max(0, Math.floor((qroleNow() - expiredSince) / DAY_MS))} 天）` : '');
+    if (!confirm(`确定要删除 QRole 账号 "${handle}" 吗？\n\n状态：${stateText}\n占用空间：${fmtBytes(account.storageBytes)}\n\n此操作将删除用户账号及全部数据（聊天记录、角色卡、世界书、备份等），不可恢复！`)) return;
+    const confirmText = prompt(`请输入用户名 "${handle}" 以确认删除：`);
+    if (confirmText !== handle) {
+        if (confirmText !== null) toast('用户名不匹配，操作已取消', true);
+        return;
+    }
+
+    try {
+        const r = await fetch('/api/stc/users/delete-single', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ handle }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d?.error || '删除失败');
+        toast(`用户 "${handle}" 已删除`);
+        _qroleSelected.delete(handle);
+        await loadQroleAccounts();
+    } catch (e) {
+        toast('删除失败: ' + e.message, true);
+    }
+}
+
+async function deleteSelectedQroleAccounts() {
+    const handles = [..._qroleSelected];
+    if (!handles.length) return;
+    const { bytes, unknown } = sumQroleStorage(selectedQroleAccounts());
+    const names = handles.slice(0, 5).join(', ') + (handles.length > 5 ? ` 等 ${handles.length} 人` : '');
+    if (!confirm(`⚠ 危险操作！确定要删除选中的 ${handles.length} 个 QRole 账号吗？\n\n用户：${names}\n合计占用空间：${fmtBytes(bytes)}${unknown ? `（另有 ${unknown} 个未知）` : ''}\n\n此操作将永久删除这些账号及全部数据，不可恢复！`)) return;
+
+    const btn = document.getElementById('stc-qa-batch-delete');
+    if (btn) { btn.disabled = true; btn._orig = btn.innerHTML; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 删除中...'; }
+    try {
+        const r = await fetch('/api/stc/users/delete-batch', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ handles }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+        const deleted = Array.isArray(d.deleted) ? d.deleted : [];
+        const failed = Array.isArray(d.failed) ? d.failed : [];
+        deleted.forEach(h => _qroleSelected.delete(h));
+        let msg = `已删除 ${deleted.length} 个账号`;
+        if (failed.length) msg += `，${failed.length} 个失败：${failed.slice(0, 3).map(f => `${f.handle}（${f.error}）`).join('；')}`;
+        toast(msg, failed.length > 0);
+        await loadQroleAccounts();
+    } catch (e) {
+        toast('批量删除失败: ' + e.message, true);
+    } finally {
+        if (btn?.isConnected) { btn.disabled = false; btn.innerHTML = btn._orig; }
+    }
+}
+
+async function saveQroleCleanupSettings() {
+    const enabled = !!document.getElementById('stc-qa-cleanup-enabled')?.checked;
+    const daysInput = document.getElementById('stc-qa-cleanup-days');
+    const daysText = daysInput?.value?.trim() ?? '';
+    const afterDays = daysText
+        ? Number(daysText)
+        : (daysInput?.validity?.badInput ? NaN : QROLE_DEFAULTS.expiredCleanup.afterDays);
+    if (!Number.isInteger(afterDays) || afterDays < QROLE_CLEANUP_MIN_DAYS || afterDays > QROLE_CLEANUP_MAX_DAYS) {
+        toast(`过期后保留天数需为 ${QROLE_CLEANUP_MIN_DAYS}-${QROLE_CLEANUP_MAX_DAYS} 之间的整数`, true);
+        return;
+    }
+    if (enabled && _qroleCleanup.enabled !== true
+        && !confirm(`确定开启自动清理吗？\n\n开启后，服务器每天自动彻底删除会员过期（或非会员）超过 ${afterDays} 天且此期间未活跃的 QRole 账号及其全部数据，不可恢复。\n建议先点击「预览将被清理的账号」确认名单。`)) {
+        return;
+    }
+
+    const btn = document.getElementById('stc-qa-cleanup-save');
+    if (btn) btn.disabled = true;
+    try {
+        const r = await fetch('/api/stc/oauth-config/config', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ provider: 'qrole', expiredCleanup: { enabled, afterDays } }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+        toast('清理设置已保存');
+        await loadQroleAccounts({ syncCleanupForm: true });
+    } catch (e) {
+        toast('保存失败: ' + e.message, true);
+    } finally {
+        if (btn?.isConnected) btn.disabled = false;
+    }
+}
+
+async function previewQroleCleanup() {
+    const resultDiv = document.getElementById('stc-qa-cleanup-result');
+    if (!resultDiv) return;
+    resultDiv.style.display = '';
+    resultDiv.innerHTML = '<div style="text-align:center;padding:16px;color:#888"><i class="fa-solid fa-spinner fa-spin"></i> 扫描中...</div>';
+    try {
+        const r = await fetch('/api/stc/qrole-accounts/cleanup/preview', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({}),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+        const candidates = (Array.isArray(d) ? d : (Array.isArray(d.candidates) ? d.candidates : []))
+            .filter(c => c && typeof c.handle === 'string');
+        const disabledNote = _qroleCleanup.enabled !== true
+            ? '<div style="font-size:.8em;color:#f39c12;margin-bottom:8px"><i class="fa-solid fa-circle-info"></i> 自动清理当前未启用，以下为按当前设置计算的结果。</div>'
+            : '';
+        if (!candidates.length) {
+            resultDiv.innerHTML = `${disabledNote}<div style="color:#27ae60;padding:12px"><i class="fa-solid fa-check-circle"></i> 当前没有达到清理时间的账号</div>`;
+            return;
+        }
+        const { bytes, unknown } = sumQroleStorage(candidates);
+        const now = qroleNow();
+        const td = 'padding:6px 8px';
+        resultDiv.innerHTML = `
+          <div style="background:rgba(255,255,255,.04);border-radius:8px;padding:14px">
+            ${disabledNote}
+            <div style="font-weight:600;margin-bottom:10px;color:#f39c12;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <i class="fa-solid fa-user-clock"></i>
+              <span>下次运行将处理 ${candidates.length} 个账号（每次最多删除 20 个），合计占用 ${esc(fmtBytes(bytes))}${unknown ? `（${unknown} 个未知）` : ''}</span>
+            </div>
+            <div style="overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;font-size:.82em;min-width:620px">
+              <thead><tr style="color:#888;border-bottom:1px solid #333">
+                <th style="${td};text-align:left">用户名</th>
+                <th style="${td};text-align:left">状态</th>
+                <th style="${td};text-align:left">到期时间</th>
+                <th style="${td};text-align:right">占用空间</th>
+                <th style="${td};text-align:left">计划清理</th>
+                <th style="${td};text-align:left">删除前复核</th>
+              </tr></thead>
+              <tbody>
+                ${candidates.map(c => {
+                    const expiresAt = toMs(c.expiresAt);
+                    const cleanupAt = toMs(c.cleanupAt);
+                    return `<tr style="border-bottom:1px solid rgba(255,255,255,.04)">
+                      <td style="${td};font-weight:600">${esc(c.handle)}</td>
+                      <td style="${td}">${esc(qroleStateLabel(c.state))}</td>
+                      <td style="${td};color:#888">${expiresAt !== null ? fmtDate(expiresAt) : '—'}</td>
+                      <td style="${td};text-align:right;color:#888">${esc(fmtBytes(c.storageBytes))}</td>
+                      <td style="${td};color:${cleanupAt !== null && cleanupAt <= now ? '#e74c3c' : '#888'}">${cleanupAt !== null ? fmtDate(cleanupAt) : '—'}</td>
+                      <td style="${td}">${c.wouldVerify ? '<span style="color:#27ae60">是（先向 QRole 复核）</span>' : '<span style="color:#888">否（无可用令牌）</span>'}</td>
+                    </tr>`;
+                }).join('')}
+              </tbody>
+            </table></div>
+          </div>`;
+    } catch (e) {
+        resultDiv.innerHTML = `<div style="color:#e74c3c;padding:12px">预览失败: ${esc(e.message)}</div>`;
+    }
+}
+
+async function runQroleCleanup() {
+    // The server only runs the job while automatic cleanup is enabled (same rules as the scheduler)
+    if (_qroleCleanup.enabled !== true) {
+        toast('请先勾选「启用自动清理」并保存清理设置', true);
+        return;
+    }
+    if (!confirm('⚠ 确定立即执行一次过期 QRole 账号清理吗？\n\n将彻底删除已达到清理时间的账号及其全部数据（每次最多 20 个）；有刷新令牌的账号会先向 QRole 复核，已续费的不会被删除。\n此操作不可恢复！建议先预览名单。')) return;
+
+    const btn = document.getElementById('stc-qa-cleanup-run');
+    const resultDiv = document.getElementById('stc-qa-cleanup-result');
+    if (btn) { btn.disabled = true; btn._orig = btn.innerHTML; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 清理中...'; }
+    if (resultDiv) {
+        resultDiv.style.display = '';
+        resultDiv.innerHTML = '<div style="text-align:center;padding:16px;color:#888"><i class="fa-solid fa-spinner fa-spin"></i> 清理中，请稍候...</div>';
+    }
+    try {
+        // Runs in the background on the server: a long run (QRole checks, large data folders)
+        // must not depend on this request staying open behind a reverse proxy
+        const r = await fetch('/api/stc/qrole-accounts/cleanup/run', {
+            method: 'POST',
+            headers: getHeaders(),
+            body: JSON.stringify({ background: true }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            if (r.status >= 500 && !d?.error) {
+                throw new Error(`HTTP ${r.status}（任务可能仍在服务器上运行，请稍后点击「刷新」查看上次运行结果）`);
+            }
+            throw new Error(d?.error || `HTTP ${r.status}`);
+        }
+        const result = r.status === 202 ? await waitForQroleCleanup(toMs(d.startedAt)) : d;
+        if (!result) {
+            if (resultDiv) resultDiv.innerHTML = '<div style="color:#f39c12;padding:12px"><i class="fa-solid fa-hourglass-half"></i> 清理仍在服务器上运行，请稍后点击「刷新」查看结果</div>';
+            return;
+        }
+        const summary = describeQroleCleanupResult(result);
+        if (resultDiv) resultDiv.innerHTML = `<div style="color:#27ae60;padding:12px"><i class="fa-solid fa-check-circle"></i> 清理完成：${summary}</div>`;
+        toast('清理任务已执行');
+        _qroleSelected.clear();
+        await loadQroleAccounts();
+    } catch (e) {
+        toast('清理失败: ' + e.message, true);
+        if (resultDiv) resultDiv.innerHTML = `<div style="color:#e74c3c;padding:12px">清理失败: ${esc(e.message)}</div>`;
+    } finally {
+        if (btn?.isConnected) { btn.disabled = false; btn.innerHTML = btn._orig; }
+    }
+}
+
+/**
+ * Poll the cleanup status until the background run that started at `startedAt` finished.
+ * @param {number|null} startedAt Server time the run started
+ * @returns {Promise<object|null>} The run result, or null when it is still running (gave up
+ *   waiting, or the QRole tab was closed)
+ */
+async function waitForQroleCleanup(startedAt) {
+    const deadline = Date.now() + QROLE_CLEANUP_POLL_MAX_MS;
+    while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, QROLE_CLEANUP_POLL_MS));
+        if (!document.getElementById('stc-qa-cleanup-result')) return null;
+        try {
+            const r = await fetch('/api/stc/qrole-accounts/cleanup/status', { headers: getHeaders(), cache: 'no-store' });
+            if (!r.ok) continue; // e.g. a proxy hiccup: keep waiting
+            const cleanup = await r.json();
+            if (!cleanup || typeof cleanup !== 'object' || cleanup.running === true) continue;
+            const lastRunAt = toMs(cleanup.lastRunAt);
+            if (startedAt === null || (lastRunAt !== null && lastRunAt >= startedAt)) return cleanup.lastResult || {};
+        } catch {
+            // Network error: keep waiting
+        }
+    }
+    return null;
 }
 
 // ═══════════════════════════════════════════════════

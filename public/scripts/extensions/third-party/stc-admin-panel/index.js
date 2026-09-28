@@ -3,6 +3,7 @@
 
 let userExtInfo = null;
 let isAdmin = false;
+let currentHandle = '';
 let adminPanelModule = null;
 
 // ── Lightweight CSRF helper ───────────────────────────────────
@@ -273,6 +274,312 @@ function showExpiryWarningToast(info) {
     }, 12000);
 }
 
+// ── QRole membership expiry banner (QRole accounts) ──────────
+const QROLE_STATUS_POLL_MS = 6 * 60 * 60 * 1000;
+const QROLE_BANNER_SNOOZE_MS = 24 * 60 * 60 * 1000;
+const QROLE_DEFAULT_RENEW_URL = 'https://www.qqy.one/membership';
+const QROLE_BANNER_ID = 'stc-qrole-banner';
+
+// Toasts for POST /api/stc/qrole/refresh-status when the membership is still close to expiry
+const QROLE_REFRESH_RESULT_MESSAGES = {
+    ok: ['info', 'QRole 暂未返回新的到期时间，续费可能尚未生效，请稍后再试'],
+    no_token: ['warning', '当前没有可用的 QRole 授权，续费后请重新使用 QRole 登录'],
+    transient: ['warning', '暂时无法连接 QRole，请稍后再试'],
+    definitive: ['warning', 'QRole 授权已失效，续费后请重新使用 QRole 登录'],
+};
+
+let _qroleBannerStarted = false;
+let _qroleRefreshBusy = false;
+
+/**
+ * Timestamp from an STC API value (ms number, seconds number or ISO string).
+ * @param {*} value
+ * @returns {number|null} Milliseconds, or null when missing/invalid
+ */
+function toTimestamp(value) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        return value < 1e12 ? value * 1000 : value;
+    }
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+}
+
+/**
+ * Format a timestamp as local `YYYY-MM-DD HH:mm`.
+ * @param {number} ms
+ * @returns {string}
+ */
+function formatDateTimeMinutes(ms) {
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * Only allow absolute http(s) links (blocks javascript:/data: URLs from config).
+ * @param {*} value
+ * @returns {string} Normalized URL or ''
+ */
+function safeHttpUrl(value) {
+    if (typeof value !== 'string' || !value.trim()) return '';
+    try {
+        const url = new URL(value.trim());
+        return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : '';
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * Display label of the membership tier (tierName, else the tier id in upper case).
+ * @param {object} status Response of GET /api/stc/qrole/status
+ * @returns {string}
+ */
+function qroleTierLabel(status) {
+    const name = typeof status?.tierName === 'string' ? status.tierName.trim() : '';
+    if (name) return Array.from(name).slice(0, 32).join('');
+    const tier = typeof status?.tier === 'string' ? status.tier.trim() : '';
+    return tier ? Array.from(tier.toUpperCase()).slice(0, 32).join('') : '';
+}
+
+/**
+ * Whether the reminder applies: QRole account with a known expiry inside the reminder window.
+ * @param {object} status
+ * @returns {boolean}
+ */
+function shouldShowQroleBanner(status) {
+    if (!status || status.qrole !== true) return false;
+    if (toTimestamp(status.expiresAt) === null) return false;
+    const reminderDays = Number(status.reminderDays);
+    if (!Number.isFinite(reminderDays) || reminderDays <= 0) return false;
+    if (typeof status.daysLeft !== 'number' || !Number.isFinite(status.daysLeft)) return false;
+    return status.daysLeft <= reminderDays;
+}
+
+/**
+ * Whether a renewal is picked up without a new QRole login: the server keeps a refresh token that
+ * is still valid when the current membership runs out (that is when the session guard asks QRole
+ * again). A token that expires earlier forces a QRole login before the renewal matters.
+ * @param {object} status
+ * @returns {boolean}
+ */
+function hasUsableQroleToken(status) {
+    if (status?.backgroundReverify === false || status?.hasRefreshToken !== true) return false;
+    const tokenExpiresAt = toTimestamp(status.refreshTokenExpiresAt);
+    const expiresAt = toTimestamp(status.expiresAt);
+    if (tokenExpiresAt === null || tokenExpiresAt <= Date.now()) return false;
+    return expiresAt === null || tokenExpiresAt > expiresAt;
+}
+
+/**
+ * localStorage key of the 24 h dismissal (per account and membership expiry, so a new expiry
+ * date shows the banner again).
+ * @param {object} status
+ * @returns {string}
+ */
+function qroleBannerSnoozeKey(status) {
+    return `stc_qrole_banner_dismissed:${currentHandle}:${toTimestamp(status?.expiresAt) ?? ''}`;
+}
+
+function isQroleBannerSnoozed(status) {
+    try {
+        const dismissedAt = Number(localStorage.getItem(qroleBannerSnoozeKey(status)));
+        return Number.isFinite(dismissedAt) && dismissedAt > 0 && Date.now() - dismissedAt < QROLE_BANNER_SNOOZE_MS;
+    } catch {
+        return false;
+    }
+}
+
+function snoozeQroleBanner(status) {
+    try {
+        localStorage.setItem(qroleBannerSnoozeKey(status), String(Date.now()));
+    } catch {
+        // Ignore localStorage errors (the banner just shows again on the next load)
+    }
+}
+
+/**
+ * GET /api/stc/qrole/status
+ * @returns {Promise<object|null>} Status, or null when unavailable
+ */
+async function fetchQroleStatus() {
+    try {
+        const r = await fetch('/api/stc/qrole/status', { cache: 'no-store' });
+        if (!r.ok) return null;
+        const data = await r.json();
+        return data && typeof data === 'object' ? data : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Show, update or remove the expiry banner for a status.
+ * @param {object} status Response of GET /api/stc/qrole/status
+ */
+function renderQroleBanner(status) {
+    const existing = document.getElementById(QROLE_BANNER_ID);
+    if (!shouldShowQroleBanner(status) || isQroleBannerSnoozed(status)) {
+        existing?.remove();
+        return;
+    }
+
+    const expiresAt = toTimestamp(status.expiresAt);
+    const tierLabel = qroleTierLabel(status);
+    const membership = tierLabel ? `QRole ${tierLabel} 会员` : 'QRole 会员';
+    const remainingMs = expiresAt - Date.now();
+    let message;
+    if (remainingMs <= 0) {
+        message = `您的 ${membership}已于 ${formatDateTimeMinutes(expiresAt)} 到期。`;
+    } else {
+        const when = remainingMs < 86400000 ? '不足 1 天' : `${Math.max(1, Math.ceil(status.daysLeft))} 天后`;
+        message = `您的 ${membership}将于 ${formatDateTimeMinutes(expiresAt)}（${when}）到期。`;
+    }
+    const hint = hasUsableQroleToken(status)
+        ? '续费后无需重新登录，即可继续使用'
+        : '续费后请重新使用 QRole 登录';
+
+    // Built with DOM properties only: tier name / URL come from the server and QRole
+    const banner = document.createElement('div');
+    banner.id = QROLE_BANNER_ID;
+    banner.setAttribute('role', 'status');
+    banner.setAttribute('aria-live', 'polite');
+
+    const icon = document.createElement('i');
+    icon.className = 'fa-solid fa-crown stc-qrole-banner-icon';
+    icon.setAttribute('aria-hidden', 'true');
+
+    const body = document.createElement('div');
+    body.className = 'stc-qrole-banner-body';
+    const text = document.createElement('div');
+    text.className = 'stc-qrole-banner-text';
+    text.textContent = message;
+    const sub = document.createElement('div');
+    sub.className = 'stc-qrole-banner-sub';
+    sub.textContent = hint;
+
+    const actions = document.createElement('div');
+    actions.className = 'stc-qrole-banner-actions';
+    const renew = document.createElement('a');
+    renew.className = 'stc-qrole-banner-btn primary';
+    renew.href = safeHttpUrl(status.renewUrl) || QROLE_DEFAULT_RENEW_URL;
+    renew.target = '_blank';
+    renew.rel = 'noopener noreferrer';
+    renew.innerHTML = '<i class="fa-solid fa-crown"></i> ';
+    renew.append('去续费');
+    const refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.className = 'stc-qrole-banner-btn';
+    refresh.innerHTML = '<i class="fa-solid fa-rotate-right"></i> ';
+    refresh.append('我已续费，刷新状态');
+    refresh.addEventListener('click', () => refreshQroleStatus(refresh));
+    actions.append(renew, refresh);
+    body.append(text, sub, actions);
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'stc-qrole-banner-close';
+    close.title = '关闭（24 小时内不再提醒）';
+    close.setAttribute('aria-label', '关闭');
+    close.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+    close.addEventListener('click', () => {
+        snoozeQroleBanner(status);
+        banner.remove();
+    });
+
+    banner.append(icon, body, close);
+    if (existing) existing.replaceWith(banner);
+    else document.documentElement.appendChild(banner); // <html>: escapes body overflow clipping on mobile
+}
+
+/**
+ * 「我已续费，刷新状态」: re-verify the membership with QRole now.
+ * @param {HTMLButtonElement} button
+ */
+async function refreshQroleStatus(button) {
+    if (_qroleRefreshBusy) return;
+    _qroleRefreshBusy = true;
+    const originalHtml = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 正在确认…';
+    try {
+        const r = await fetch('/api/stc/qrole/refresh-status', {
+            method: 'POST',
+            headers: await getCsrfHeaders(),
+            body: JSON.stringify({}),
+        });
+        let data = null;
+        try {
+            data = await r.json();
+        } catch {
+            // non-JSON body
+        }
+        if (!r.ok) {
+            // 401 QROLE_MEMBERSHIP: the fetch guard already shows a message and redirects
+            if (r.status === 401 && data?.code === 'QROLE_MEMBERSHIP') return;
+            const error = typeof data?.error === 'string' && data.error ? data.error : `刷新失败（HTTP ${r.status}）`;
+            toastr?.error?.(error);
+            return;
+        }
+
+        if (data?.valid === false) {
+            // Go straight to the login page with the reason: the session guard ends the session on
+            // that request (or already did on a background request, which a plain reload would turn
+            // into an unexplained anonymous welcome page)
+            const reason = typeof data.reason === 'string' && /^[a-z_]{1,40}$/.test(data.reason) ? data.reason : '';
+            toastr?.warning?.('您的 QRole 会员已失效，即将跳转到登录页…', '', { timeOut: 3000 });
+            setTimeout(() => {
+                if (reason) window.location.href = '/login?oauth_error=' + encodeURIComponent(reason);
+                else location.reload();
+            }, 2000);
+            return;
+        }
+
+        const status = data?.status && typeof data.status === 'object' ? data.status : null;
+        if (status && !shouldShowQroleBanner(status)) {
+            document.getElementById(QROLE_BANNER_ID)?.remove();
+            const expiresAt = toTimestamp(status.expiresAt);
+            toastr?.success?.(expiresAt
+                ? `会员状态已更新，有效期至 ${formatDateTimeMinutes(expiresAt)}`
+                : '会员状态已更新');
+            return;
+        }
+        if (status) renderQroleBanner(status);
+        const [level, message] = Object.hasOwn(QROLE_REFRESH_RESULT_MESSAGES, data?.result)
+            ? QROLE_REFRESH_RESULT_MESSAGES[data.result]
+            : ['info', '会员状态已刷新'];
+        toastr?.[level]?.(message);
+    } catch {
+        toastr?.error?.('网络错误，请稍后重试');
+    } finally {
+        _qroleRefreshBusy = false;
+        if (button.isConnected) {
+            button.disabled = false;
+            button.innerHTML = originalHtml;
+        }
+    }
+}
+
+/** Check the membership status now and every 6 hours. */
+function initQroleExpiryBanner() {
+    if (_qroleBannerStarted) return;
+    _qroleBannerStarted = true;
+    const check = async () => {
+        const status = await fetchQroleStatus();
+        // Keep the current banner when the status is temporarily unavailable
+        if (status) renderQroleBanner(status);
+        return status;
+    };
+    check().then((status) => {
+        // Non-QRole accounts never need the reminder: skip the polling
+        if (status && status.qrole === false) return;
+        setInterval(check, QROLE_STATUS_POLL_MS);
+    });
+}
+
 // ── Password Reminder Popup (OAuth users without password) ───
 async function showPasswordReminderPopup(info) {
     // Only show for OAuth users without password
@@ -350,6 +657,7 @@ jQuery(async () => {
         if (profileResp.ok) {
             const profile = await profileResp.json();
             isAdmin = !!profile.admin;
+            currentHandle = typeof profile.handle === 'string' ? profile.handle : '';
         }
     } catch (e) {
         console.debug('[STC-MOD] Could not fetch user profile:', e.message);
@@ -359,6 +667,9 @@ jQuery(async () => {
     if (isAdmin) {
         injectAdminButton();
         injectAdminNavLink();
+    } else if (currentHandle) {
+        // QRole membership expiry reminder: logged-in users only (admins are never QRole-gated)
+        initQroleExpiryBanner();
     }
 
     // Step 2.5: Fetch public config (purchase link)
@@ -1969,8 +2280,9 @@ async function openAdminPanel() {
     }
 }
 
+/** HTML-escape text for element content AND quoted attribute values (quotes included). */
 function esc(s) {
     const d = document.createElement('div');
     d.textContent = String(s ?? '');
-    return d.innerHTML;
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }

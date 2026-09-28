@@ -9,8 +9,8 @@
  * - configureTrustProxy(app) -> Reverse proxy trust (before cookie-session)
  * - shouldSkipCsrf(req)    -> CSRF exemption check
  * - setupPublicRoutes(app) -> Password-migration gate, QRole password-login gate,
- *                             QRole session guard, page routes (before official routes
- *                             and login middleware)
+ *                             QRole session guard, page routes incl. the QRole
+ *                             export-only page (before official routes and login middleware)
  * - setupPublicApi(app)    -> Public API routes (no auth required)
  * - setupPrivateRoutes(app)-> Private API routes (auth required)
  */
@@ -33,6 +33,8 @@ import { isRegistrationEnabled } from './services/registration.js';
 import { runPasswordMigrationOnce } from './services/password-migration.js';
 import { liveMetaForRecord } from './services/account-security.js';
 import { qroleSessionGuard } from './services/qrole-session.js';
+import { clearExportSession, resolveExportSession } from './services/qrole-export.js';
+import { startQroleCleanupScheduler } from './services/qrole-cleanup.js';
 import { isPasswordLoginAllowed } from './routes/private/set-password.js';
 import { sendSitePage } from './services/site-config.js';
 
@@ -163,6 +165,15 @@ async function passwordlessLoginGate(req, res, next) {
 }
 
 /**
+ * A password login replaces any QRole export-only session of the browser.
+ * @type {import('express').RequestHandler}
+ */
+function clearQroleExportOnLogin(req, res, next) {
+    clearExportSession(req);
+    return next();
+}
+
+/**
  * Hook B: Setup public routes and page overrides.
  * Called BEFORE the official login page route, so our routes take priority.
  * @param {import('express').Express} app
@@ -188,7 +199,7 @@ export async function setupPublicRoutes(app) {
     // Mounted as a router like the official usersPublicRouter so that every path variant the
     // official route accepts (//login, /LOGIN/, trailing slash...) goes through the gate too.
     const loginGate = express.Router();
-    loginGate.post('/login', defaultMissingPassword, qroleLoginGate, passwordlessLoginGate);
+    loginGate.post('/login', clearQroleExportOnLogin, defaultMissingPassword, qroleLoginGate, passwordlessLoginGate);
     app.use('/api/users', loginGate);
 
     // End sessions of QRole accounts whose membership lapsed or must be re-verified
@@ -216,6 +227,23 @@ export async function setupPublicRoutes(app) {
             return next();
         }
         return sendSitePage(res, 'welcome.html', 'welcome').catch(next);
+    });
+
+    // QRole export-only page: lapsed members download their data without being logged in.
+    // Requires the export session created by the QRole OAuth callback.
+    app.get('/qrole-expired', async (req, res, next) => {
+        try {
+            if (req.session?.handle) return res.redirect('/');
+            const state = await resolveExportSession(req);
+            if (state.status === 'none') return res.redirect('/login');
+            if (state.status !== 'valid') {
+                clearExportSession(req);
+                return res.redirect('/login?oauth_error=export_expired');
+            }
+            return await sendSitePage(res, 'qrole-expired.html', 'qrole-expired');
+        } catch (error) {
+            return next(error);
+        }
     });
 
     // Registration page (redirect to login when registration is closed)
@@ -264,6 +292,10 @@ export async function setupPublicApi(app) {
     // Public config (for frontend to query enabled features)
     const { router: publicConfigRouter } = await import('./routes/public/public-config.js');
     app.use('/api/stc/public-config', publicConfigRouter);
+
+    // QRole export-only access (bound to the export session of the QRole OAuth callback)
+    const { router: qroleExportRouter } = await import('./routes/public/qrole-export.js');
+    app.use('/api/stc/qrole-export', qroleExportRouter);
 
     console.log('[STC-MOD] Public API routes registered.');
 }
@@ -324,6 +356,15 @@ export async function setupPrivateRoutes(app) {
     // Password management (user)
     const { router: setPasswordRouter } = await import('./routes/private/set-password.js');
     app.use('/api/stc/users', setPasswordRouter);
+
+    // QRole membership status of the current user (expiry reminder)
+    const { router: qroleStatusRouter } = await import('./routes/private/qrole-status.js');
+    app.use('/api/stc/qrole', qroleStatusRouter);
+
+    // QRole account management + expired-account cleanup (admin)
+    const { router: qroleAccountsRouter } = await import('./routes/private/qrole-accounts.js');
+    app.use('/api/stc/qrole-accounts', qroleAccountsRouter);
+    startQroleCleanupScheduler();
 
     console.log('[STC-MOD] Private API routes registered.');
 }

@@ -3,83 +3,34 @@
  *
  * QRole membership is checked in the OAuth callback, but sessions outlive it (the official cookie
  * lasts up to 400 days). This guard re-checks the membership snapshot stored at login
- * (qroleTier, qroleMembershipExpiresAt, qroleCheckedAt) on every request of a QRole account and
- * ends the session once the membership expired, the tier is no longer allowed, or the snapshot is
- * older than `oauth.qrole.reverifyHours` (forcing a fresh QRole login and thus a fresh check).
+ * (qroleTier, qroleMembershipExpiresAt, qroleCheckedAt) on every request of a QRole account.
  * The re-verification deadline applies to page loads; API calls get twice the window, so a chat
- * that is in progress is not cut off mid-request (the next reload asks for a fresh login).
+ * that is in progress is not cut off mid-request.
+ *
+ * When the snapshot is no longer valid and the account has a usable QRole refresh token (background
+ * re-verification, `oauth.qrole.backgroundReverify`), the membership is re-checked with QRole first:
+ * renewed members simply continue. Otherwise (or when QRole still says the membership lapsed) the
+ * session ends: the membership expired, the tier is no longer allowed, or the snapshot is too old
+ * (forcing a fresh QRole login). While QRole is unreachable, a snapshot that is merely due for
+ * re-verification is honored for up to twice the window; expired / non-member snapshots are not.
+ * Right after QRole itself reported the lapse (5 minutes), replayed old session cookies are refused
+ * without asking QRole again.
  * Must be registered AFTER setUserDataMiddleware (needs req.user).
  */
-import { getStcConfig } from '../config.js';
 import { getUserMeta } from '../user-metadata.js';
 import { liveMetaForRecord } from './account-security.js';
-import { normalizeAllowedTiers } from './qrole-membership.js';
+import {
+    decideQroleSession,
+    getQroleConfig,
+    hasStoredRefreshToken,
+    isRefreshTokenFeatureOn,
+    resolveQroleLifecycleConfig,
+    QROLE_SESSION_MESSAGES,
+} from './qrole-lifecycle.js';
+import { isVerificationCoolingDown, verifyQroleMembership } from './qrole-reverify.js';
 
-/** Re-verification window (hours) when `oauth.qrole.reverifyHours` is not configured. */
-export const DEFAULT_REVERIFY_HOURS = 24;
-
-/** API error messages per invalid-session reason (same wording as the login page). */
-export const QROLE_SESSION_MESSAGES = Object.freeze({
-    membership_expired: '您的 QRole 会员已过期，续费后即可登录',
-    not_member: '仅 QRole VIP / SVIP 会员可以登录',
-    membership_reverify: '为确认会员状态，请重新使用 QRole 登录',
-});
-
-/**
- * @typedef {Object} QroleSessionResult
- * @property {boolean} valid Whether the session may continue
- * @property {null|'membership_expired'|'not_member'|'membership_reverify'} reason Why it is invalid
- */
-
-/**
- * Re-verification window in hours from config (non-numeric → default; ≤ 0 disables the rule).
- * @param {*} value `oauth.qrole.reverifyHours`
- * @returns {number}
- */
-function getReverifyHours(value) {
-    if (value === undefined || value === null || value === '') return DEFAULT_REVERIFY_HOURS;
-    const hours = Number(value);
-    return Number.isFinite(hours) ? hours : DEFAULT_REVERIFY_HOURS;
-}
-
-/**
- * Evaluate whether a QRole account's session is still backed by a valid membership snapshot.
- * @param {object|null|undefined} meta STC metadata of the (live) QRole account
- * @param {object|null|undefined} cfg `oauth.qrole` config (requireMembership, allowedTiers, reverifyHours)
- * @param {number} [now] Current time in ms
- * @param {{isApi?: boolean}} [opts] API requests get a doubled re-verification window
- * @returns {QroleSessionResult}
- */
-export function evaluateQroleSession(meta, cfg, now = Date.now(), opts = {}) {
-    const data = meta && typeof meta === 'object' ? meta : {};
-    const config = cfg && typeof cfg === 'object' ? cfg : {};
-
-    if (config.requireMembership === false) {
-        return { valid: true, reason: null };
-    }
-
-    const expiresAt = data.qroleMembershipExpiresAt;
-    if (typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt <= now) {
-        return { valid: false, reason: 'membership_expired' };
-    }
-
-    const tier = typeof data.qroleTier === 'string' ? data.qroleTier.trim().toLowerCase() : '';
-    if (!tier || !normalizeAllowedTiers(config.allowedTiers).includes(tier)) {
-        return { valid: false, reason: 'not_member' };
-    }
-
-    const reverifyHours = getReverifyHours(config.reverifyHours);
-    if (reverifyHours > 0) {
-        const windowMs = reverifyHours * 3600 * 1000 * (opts.isApi ? 2 : 1);
-        const checkedAt = data.qroleCheckedAt;
-        const hasCheckedAt = typeof checkedAt === 'number' && Number.isFinite(checkedAt);
-        if (!hasCheckedAt || now - checkedAt > windowMs) {
-            return { valid: false, reason: 'membership_reverify' };
-        }
-    }
-
-    return { valid: true, reason: null };
-}
+// The pure session evaluation lives in qrole-lifecycle.js (unit-testable); re-exported for callers
+export { DEFAULT_REVERIFY_HOURS, QROLE_SESSION_MESSAGES, evaluateQroleSession } from './qrole-lifecycle.js';
 
 /**
  * End sessions of QRole accounts whose membership is no longer valid.
@@ -88,20 +39,31 @@ export function evaluateQroleSession(meta, cfg, now = Date.now(), opts = {}) {
  * Admins, non-QRole accounts and accounts with stale metadata are never affected.
  * @type {import('express').RequestHandler}
  */
-export function qroleSessionGuard(req, res, next) {
+export async function qroleSessionGuard(req, res, next) {
     try {
         const profile = req.user?.profile;
         if (!profile || profile.admin) return next();
 
-        const meta = liveMetaForRecord(getUserMeta(profile.handle), profile);
+        const handle = profile.handle;
+        const meta = liveMetaForRecord(getUserMeta(handle), profile);
         if (meta?.oauthProvider !== 'qrole') return next();
 
-        const raw = getStcConfig('oauth.qrole', {});
-        const cfg = raw && typeof raw === 'object' ? raw : {};
+        const cfg = getQroleConfig();
         if (cfg.requireMembership === false) return next();
 
         const isApi = String(req.path).toLowerCase().startsWith('/api/');
-        const { valid, reason } = evaluateQroleSession(meta, cfg, Date.now(), { isApi });
+        const now = Date.now();
+        const lifecycle = resolveQroleLifecycleConfig(cfg);
+        const { valid, reason } = await decideQroleSession({
+            meta,
+            cfg,
+            now,
+            isApi,
+            verifyAvailable: isRefreshTokenFeatureOn(lifecycle) && hasStoredRefreshToken(meta, now),
+            inCooldown: isVerificationCoolingDown(handle, now),
+            verify: () => verifyQroleMembership(handle, { reason: 'session' }),
+            reloadMeta: () => liveMetaForRecord(getUserMeta(handle), profile),
+        });
         if (valid) return next();
 
         // Destroy the session (cookie-session clears the cookie) and drop the user

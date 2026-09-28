@@ -7,6 +7,13 @@ import express from 'express';
 import { requireAdminMiddleware } from '../../../users.js';
 import { getStcConfig, setStcConfigs } from '../../config.js';
 import { OAUTH_PROVIDERS } from '../../services/account-security.js';
+import {
+    MAX_CLEANUP_AFTER_DAYS,
+    MAX_EXPIRY_REMINDER_DAYS,
+    MIN_CLEANUP_AFTER_DAYS,
+    isHttpUrl,
+    resolveQroleLifecycleConfig,
+} from '../../services/qrole-lifecycle.js';
 
 export const router = express.Router();
 
@@ -24,7 +31,7 @@ const URL_FIELDS = ['callbackUrl', ...ENDPOINT_FIELDS];
 /** QRole-only list fields (array or comma-separated string). */
 const QROLE_LIST_FIELDS = ['allowedTiers', 'tierClaims', 'expiryClaims'];
 /** QRole-only boolean fields. */
-const QROLE_BOOLEAN_FIELDS = ['usePkce', 'requireMembership'];
+const QROLE_BOOLEAN_FIELDS = ['usePkce', 'requireMembership', 'backgroundReverify', 'expiredDataExport'];
 /** QRole membership re-verification window (hours); 0 disables it. */
 const DEFAULT_REVERIFY_HOURS = 24;
 const MAX_REVERIFY_HOURS = 8760;
@@ -42,6 +49,16 @@ function isEmptyOrHttpUrl(value) {
     } catch {
         return false;
     }
+}
+
+/**
+ * Integer from a request value (number or numeric string), or NaN.
+ * @param {*} value
+ * @returns {number}
+ */
+function toInteger(value) {
+    const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+    return Number.isInteger(number) ? number : NaN;
 }
 
 /**
@@ -78,8 +95,17 @@ router.get('/config', requireAdminMiddleware, (req, res) => {
             ...rest,
             hasClientSecret: typeof clientSecret === 'string' && clientSecret.length > 0,
         };
-        if (p === 'qrole' && (config[p].reverifyHours === undefined || config[p].reverifyHours === null)) {
-            config[p].reverifyHours = DEFAULT_REVERIFY_HOURS;
+        if (p === 'qrole') {
+            if (config[p].reverifyHours === undefined || config[p].reverifyHours === null) {
+                config[p].reverifyHours = DEFAULT_REVERIFY_HOURS;
+            }
+            // Membership lifecycle settings with the code defaults filled in
+            const lifecycle = resolveQroleLifecycleConfig(providerConfig);
+            config[p].backgroundReverify = lifecycle.backgroundReverify;
+            config[p].renewUrl = lifecycle.renewUrl;
+            config[p].expiryReminderDays = lifecycle.expiryReminderDays;
+            config[p].expiredDataExport = lifecycle.expiredDataExport;
+            config[p].expiredCleanup = { ...lifecycle.expiredCleanup };
         }
     }
     res.json(config);
@@ -142,6 +168,40 @@ router.post('/config', requireAdminMiddleware, (req, res) => {
                     return res.status(400).json({ error: `reverifyHours 必须为 0-${MAX_REVERIFY_HOURS} 之间的整数` });
                 }
                 entries[`${prefix}.reverifyHours`] = hours;
+            }
+
+            if (has('renewUrl')) {
+                const url = typeof body.renewUrl === 'string' ? body.renewUrl.trim() : null;
+                // '' restores the default QRole membership page
+                if (url === null || (url !== '' && !isHttpUrl(url))) {
+                    return res.status(400).json({ error: '续费链接必须为 http(s) 地址' });
+                }
+                entries[`${prefix}.renewUrl`] = url;
+            }
+
+            if (has('expiryReminderDays')) {
+                const days = toInteger(body.expiryReminderDays);
+                if (!Number.isInteger(days) || days < 0 || days > MAX_EXPIRY_REMINDER_DAYS) {
+                    return res.status(400).json({ error: `到期提醒提前天数必须为 0-${MAX_EXPIRY_REMINDER_DAYS} 之间的整数（0 = 不提醒）` });
+                }
+                entries[`${prefix}.expiryReminderDays`] = days;
+            }
+
+            if (has('expiredCleanup')) {
+                const cleanup = body.expiredCleanup;
+                if (typeof cleanup !== 'object' || Array.isArray(cleanup)) {
+                    return res.status(400).json({ error: 'expiredCleanup 格式无效' });
+                }
+                if (cleanup.enabled !== undefined && cleanup.enabled !== null) {
+                    entries[`${prefix}.expiredCleanup.enabled`] = !!cleanup.enabled;
+                }
+                if (cleanup.afterDays !== undefined && cleanup.afterDays !== null) {
+                    const days = toInteger(cleanup.afterDays);
+                    if (!Number.isInteger(days) || days < MIN_CLEANUP_AFTER_DAYS || days > MAX_CLEANUP_AFTER_DAYS) {
+                        return res.status(400).json({ error: `过期账号清理天数必须为 ${MIN_CLEANUP_AFTER_DAYS}-${MAX_CLEANUP_AFTER_DAYS} 之间的整数` });
+                    }
+                    entries[`${prefix}.expiredCleanup.afterDays`] = days;
+                }
             }
 
             for (const field of QROLE_LIST_FIELDS) {

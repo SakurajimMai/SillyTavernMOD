@@ -50,6 +50,52 @@ function getDirSize(dirPath) {
 }
 
 /**
+ * Total size of the files under a directory, walked asynchronously (does not block the event loop
+ * on slow / remote filesystems). Unreadable entries are skipped.
+ * @param {string} dirPath
+ * @returns {Promise<number>}
+ */
+async function getDirSizeAsync(dirPath) {
+    let total = 0;
+    let entries;
+    try {
+        entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+    } catch {
+        return 0;
+    }
+    for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        try {
+            if (entry.isDirectory()) {
+                total += await getDirSizeAsync(fullPath);
+            } else if (entry.isFile()) {
+                total += (await fs.promises.stat(fullPath)).size;
+            }
+        } catch { /* ignore */ }
+    }
+    return total;
+}
+
+/**
+ * Storage used by a user in bytes, computed asynchronously (same rules as calculateUserStorage).
+ * @param {string} handle
+ * @returns {Promise<number|null>} bytes used (0 without a data directory), null if it cannot be determined
+ */
+export async function calculateUserStorageAsync(handle) {
+    try {
+        const userDir = path.join(getDataRoot(), handle);
+        try {
+            await fs.promises.access(userDir);
+        } catch {
+            return 0;
+        }
+        return await getDirSizeAsync(userDir);
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Get storage info for a user
  */
 export function getUserStorageInfo(handle) {

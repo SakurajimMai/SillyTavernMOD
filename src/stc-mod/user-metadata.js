@@ -166,8 +166,28 @@ ensureExitHook();
  * @property {string} [registrationMethod] - Registration method: 'local' | 'github' | 'discord' | 'linuxdo' | 'qrole'
  * @property {string|null} [qroleTier] - Last seen QRole membership tier (lowercase), e.g. 'vip' / 'svip'
  * @property {number|null} [qroleMembershipExpiresAt] - Last seen QRole membership expiry (ms), null = no expiry reported
- * @property {number} [qroleCheckedAt] - Timestamp of the last QRole membership check (on login)
+ * @property {number} [qroleCheckedAt] - Timestamp of the last QRole membership check (login or background re-verification)
+ * @property {string|null} [qroleTierName] - Last seen QRole membership tier display name (membership_tier_name)
+ * @property {number|null} [qroleDeniedAt] - Most recent denied QRole login (a background check that finds no valid membership only sets it when missing); null while the last check found a valid membership
+ * @property {'refresh'} [qroleVerifiedVia] - How the last background re-verification was done
+ * @property {string} [qroleRefreshToken] - QRole refresh token, AES-256-GCM encrypted with the local key file (NEVER returned by any API)
+ * @property {number} [qroleRefreshTokenExpiresAt] - When the stored QRole refresh token expires (ms)
  */
+
+/** Metadata keys that must never leave the server (see sanitizeMeta). */
+export const SECRET_META_KEYS = Object.freeze(['qroleRefreshToken']);
+
+/**
+ * Copy of a metadata entry without secret fields, for every API that returns metadata.
+ * @param {UserExtendedData|null|undefined} meta
+ * @returns {UserExtendedData|null|undefined} Shallow copy without secrets (input returned as-is when not an object)
+ */
+export function sanitizeMeta(meta) {
+    if (!meta || typeof meta !== 'object') return meta;
+    const copy = { ...meta };
+    for (const key of SECRET_META_KEYS) delete copy[key];
+    return copy;
+}
 
 /**
  * Get extended data for a user
@@ -195,6 +215,29 @@ export function setUserMeta(handle, data, opts = {}) {
     }
     Object.assign(meta[handle], data);
     scheduleFlush(opts.immediate === true);
+}
+
+/**
+ * Remove fields from a user's extended data. Does nothing (and creates no entry) for unknown handles.
+ * @param {string} handle User handle
+ * @param {readonly string[]} fields Keys to remove
+ * @param {object} [opts]
+ * @param {boolean} [opts.immediate] Flush to disk synchronously instead of debounced.
+ * @returns {boolean} Whether anything was removed
+ */
+export function unsetUserMetaFields(handle, fields, opts = {}) {
+    const meta = loadMetadata();
+    const entry = meta?.[handle];
+    if (!entry || typeof entry !== 'object') return false;
+    let changed = false;
+    for (const field of fields) {
+        if (Object.hasOwn(entry, field)) {
+            delete entry[field];
+            changed = true;
+        }
+    }
+    if (changed) scheduleFlush(opts.immediate === true);
+    return changed;
 }
 
 /**
@@ -316,7 +359,7 @@ export function getUserStats(opts = {}) {
     const activeWindowDays = opts.activeWindowDays ?? 7;
     const meta = loadMetadata();
     if (!meta) return { total: 0, active: 0, inactive: 0, expired: 0, newToday: 0, activeWindowDays };
-    
+
     const now = Date.now();
     const activeThreshold = activeWindowDays * 24 * 60 * 60 * 1000;
     const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
