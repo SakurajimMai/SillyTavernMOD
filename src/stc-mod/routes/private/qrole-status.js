@@ -21,6 +21,7 @@ import {
     resolveQroleLifecycleConfig,
     toTimestamp,
 } from '../../services/qrole-lifecycle.js';
+import { respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
@@ -76,6 +77,7 @@ router.get('/status', (req, res) => {
     try {
         return res.json(buildStatus(req.user?.profile));
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole status error:', error);
         return res.status(500).json({ error: '获取会员状态失败' });
     }
@@ -120,6 +122,7 @@ router.post('/refresh-status', async (req, res) => {
             verifyReason: verification.reason,
         });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole refresh-status error:', error);
         return res.status(500).json({ error: '刷新会员状态失败，请稍后重试' });
     }

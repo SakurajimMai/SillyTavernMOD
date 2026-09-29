@@ -1,27 +1,20 @@
 /**
  * SillyTavernchat Module - Public Announcements (Login Page)
+ * A store that cannot be read answers 503 STORE_UNAVAILABLE (the login page then shows none),
+ * never an empty list.
  */
 import express from 'express';
-import fs from 'node:fs';
-import path from 'node:path';
-import { getStcDataDir } from '../../config.js';
+import { loadAnnouncements } from '../../services/announcements.js';
+import { respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
-function getLoginAnnouncementsPath() {
-    const dir = path.join(getStcDataDir(), 'announcements');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return path.join(dir, 'login_announcements.json');
-}
-
 router.get('/login/current', (req, res) => {
     try {
-        const filePath = getLoginAnnouncementsPath();
-        if (!fs.existsSync(filePath)) return res.json([]);
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        const valid = data.filter(a => a.enabled);
+        const valid = loadAnnouncements('login').filter(a => a && a.enabled);
         res.json(valid);
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] Get login announcements error:', error);
         res.status(500).json({ error: 'Failed to get announcements' });
     }

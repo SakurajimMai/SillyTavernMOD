@@ -1,55 +1,40 @@
 /**
  * SillyTavernchat Module - Announcements Management (Admin)
+ * Stores: services/announcements.js. A store that cannot be read answers 503 STORE_UNAVAILABLE.
  */
 import express from 'express';
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 import { requireAdminMiddleware } from '../../../users.js';
-import { getStcDataDir } from '../../config.js';
+import { getAnnouncementStore, loadAnnouncements } from '../../services/announcements.js';
+import { respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
-function getAnnouncementsDir() {
-    const dir = path.join(getStcDataDir(), 'announcements');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return dir;
-}
-
-function loadAnnouncements(type = 'main') {
-    const file = type === 'login' ? 'login_announcements.json' : 'announcements.json';
-    const filePath = path.join(getAnnouncementsDir(), file);
-    if (!fs.existsSync(filePath)) return [];
-    try {
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch {
-        return [];
-    }
-}
-
-function saveAnnouncements(data, type = 'main') {
-    const file = type === 'login' ? 'login_announcements.json' : 'announcements.json';
-    fs.writeFileSync(path.join(getAnnouncementsDir(), file), JSON.stringify(data, null, 2), 'utf8');
-}
-
 // Get current active announcements (for logged-in users)
 router.get('/current', (req, res) => {
-    const announcements = loadAnnouncements('main').filter(a => a.enabled);
-    res.json(announcements);
+    try {
+        const announcements = loadAnnouncements('main').filter(a => a.enabled);
+        res.json(announcements);
+    } catch (error) {
+        if (respondStoreError(req, res, error)) return;
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Admin: list all announcements
 router.get('/list', requireAdminMiddleware, (req, res) => {
-    const type = String(req.query.type ?? 'main');
-    res.json(loadAnnouncements(type));
+    try {
+        res.json(loadAnnouncements(req.query.type));
+    } catch (error) {
+        if (respondStoreError(req, res, error)) return;
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Admin: create announcement
 router.post('/create', requireAdminMiddleware, (req, res) => {
     try {
         const { title, content, category, type: announcementType, enabled } = req.body;
-        const type = String(req.query.type ?? 'main');
-        const announcements = loadAnnouncements(type);
         const newAnn = {
             id: crypto.randomUUID(),
             title: title || '',
@@ -61,10 +46,12 @@ router.post('/create', requireAdminMiddleware, (req, res) => {
             updatedAt: Date.now(),
             createdBy: req.user?.profile?.handle || 'admin',
         };
-        announcements.push(newAnn);
-        saveAnnouncements(announcements, type);
+        getAnnouncementStore(req.query.type).update((announcements) => {
+            announcements.push(newAnn);
+        });
         res.json({ success: true, announcement: newAnn });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         res.status(500).json({ error: error.message });
     }
 });
@@ -73,21 +60,22 @@ router.post('/create', requireAdminMiddleware, (req, res) => {
 router.post('/update', requireAdminMiddleware, (req, res) => {
     try {
         const { id, title, content, category, type: announcementType, enabled } = req.body;
-        const type = String(req.query.type ?? 'main');
-        const announcements = loadAnnouncements(type);
-        const idx = announcements.findIndex(a => a.id === id);
-        if (idx === -1) return res.status(404).json({ error: '公告不存在' });
+        const updated = getAnnouncementStore(req.query.type).update((announcements) => {
+            const idx = announcements.findIndex(a => a.id === id);
+            if (idx === -1) return null;
 
-        if (title !== undefined) announcements[idx].title = title;
-        if (content !== undefined) announcements[idx].content = content;
-        if (category !== undefined) announcements[idx].category = category;
-        if (announcementType !== undefined) announcements[idx].type = announcementType;
-        if (enabled !== undefined) announcements[idx].enabled = enabled;
-        announcements[idx].updatedAt = Date.now();
-
-        saveAnnouncements(announcements, type);
-        res.json({ success: true, announcement: announcements[idx] });
+            if (title !== undefined) announcements[idx].title = title;
+            if (content !== undefined) announcements[idx].content = content;
+            if (category !== undefined) announcements[idx].category = category;
+            if (announcementType !== undefined) announcements[idx].type = announcementType;
+            if (enabled !== undefined) announcements[idx].enabled = enabled;
+            announcements[idx].updatedAt = Date.now();
+            return announcements[idx];
+        });
+        if (!updated) return res.status(404).json({ error: '公告不存在' });
+        res.json({ success: true, announcement: updated });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         res.status(500).json({ error: error.message });
     }
 });
@@ -96,13 +84,19 @@ router.post('/update', requireAdminMiddleware, (req, res) => {
 router.post('/delete', requireAdminMiddleware, (req, res) => {
     try {
         const { id } = req.body;
-        const type = String(req.query.type ?? 'main');
-        const announcements = loadAnnouncements(type);
-        const filtered = announcements.filter(a => a.id !== id);
-        if (filtered.length === announcements.length) return res.status(404).json({ error: '公告不存在' });
-        saveAnnouncements(filtered, type);
+        const deleted = getAnnouncementStore(req.query.type).update((announcements) => {
+            const idx = announcements.findIndex(a => a.id === id);
+            if (idx === -1) return false;
+            // Same as the former filter(): every entry with this id goes
+            for (let i = announcements.length - 1; i >= 0; i--) {
+                if (announcements[i].id === id) announcements.splice(i, 1);
+            }
+            return true;
+        });
+        if (!deleted) return res.status(404).json({ error: '公告不存在' });
         res.json({ success: true });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         res.status(500).json({ error: error.message });
     }
 });

@@ -6,6 +6,10 @@
  * single use and valid for 10 minutes. An identity waiting for an invitation code is kept
  * server-side in the session, never round-tripped through the browser. Every callback failure
  * redirects to /login?oauth_error=<fixed code>.
+ *
+ * While the user metadata (OAuth links) cannot be read, findUserByOAuth throws StoreUnavailableError:
+ * the callback then redirects with `server_error` and never creates an account (a second account for
+ * an already linked identity is impossible); /complete-registration answers 503 STORE_UNAVAILABLE.
  */
 import express from 'express';
 import crypto from 'node:crypto';
@@ -13,7 +17,7 @@ import storage from 'node-persist';
 import { getStcConfig } from '../../config.js';
 import { toKey, getAccountVersion } from '../../../users.js';
 import { findUserByOAuth, flushMetadata, getUserMeta, setUserMeta, recordLogin } from '../../user-metadata.js';
-import { createOAuthUser, rollbackCreatedUser } from './register-helper.js';
+import { createOAuthUser, isAccountRecordGone, rollbackCreatedUser } from './register-helper.js';
 import * as invitationService from '../../services/invitation-codes.js';
 import { isRegistrationEnabled, sendRegistrationClosed } from '../../services/registration.js';
 import { OAUTH_PROVIDERS, isMetaForRecord } from '../../services/account-security.js';
@@ -38,6 +42,7 @@ import {
 import { syncQroleRefreshToken } from '../../services/qrole-reverify.js';
 import { startExportSession } from '../../services/qrole-export.js';
 import { isUserDeletionInProgress, waitForUserDeletion } from '../../services/user-deletion.js';
+import { assertDataRootAvailable, isStoreUnavailableError, respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
@@ -335,15 +340,18 @@ async function fetchIdentity(provider, config, token) {
 
 /**
  * Find the live account linked to an OAuth identity. Links pointing at deleted accounts (or at a
- * different account that re-used the handle) are cleared on the way. An account that is being
+ * different account that re-used the handle) are cleared on the way; a missing record is only taken
+ * for a deleted account after isAccountRecordGone() confirmed it with a usable data root. An account that is being
  * deleted (admin deletion or the QRole cleanup job) is never resumed: the lookup waits for the
  * deletion to finish and starts over, so a login racing a deletion either keeps the account (the
  * deletion was cancelled by its final check) or finds no account.
  * @param {string} provider
  * @param {string} id
  * @returns {Promise<{handle: string, record: object}|null>}
+ * @throws {import('../../services/json-store.js').StoreUnavailableError} The links, the data root or
+ *   the account records are not available (exported for tests)
  */
-async function resolveLinkedAccount(provider, id) {
+export async function resolveLinkedAccount(provider, id) {
     for (let i = 0; i < MAX_LINK_CLEANUPS; i++) {
         const handle = findUserByOAuth(provider, id);
         if (!handle) return null;
@@ -360,6 +368,16 @@ async function resolveLinkedAccount(provider, id) {
         }
         if (record && isMetaForRecord(getUserMeta(handle), record)) {
             return { handle, record };
+        }
+        // node-persist reads ENOENT as "no record": while the data root mount is gone every record
+        // is missing. Only a record confirmed gone with a usable data root is a deleted account
+        // (throws StoreUnavailableError otherwise: the callback answers server_error, nothing changed)
+        if (!record && !await isAccountRecordGone(handle)) continue;
+        // A record that does not match may come from a stale copy under a vanished mount as well
+        assertDataRootAvailable();
+        if (isUserDeletionInProgress(handle)) {
+            await waitForUserDeletion(handle);
+            continue;
         }
 
         console.warn(`[STC-MOD] Clearing stale ${provider} OAuth link on handle`, handle);
@@ -485,7 +503,14 @@ router.post('/complete-registration', async (req, res) => {
 
         // The metadata exists now, so time-limited codes get a real expiry (not permanent)
         if (invitationEnabled) {
-            const useResult = invitationService.useInvitationCode(inviteCode, userHandle);
+            let useResult;
+            try {
+                useResult = invitationService.useInvitationCode(inviteCode, userHandle);
+            } catch (error) {
+                // e.g. the code store became unavailable: do not keep an account without the code
+                await rollbackCreatedUser(userHandle);
+                throw error;
+            }
             if (!useResult.success) {
                 // e.g. the same code was consumed concurrently: do not keep an account without it
                 await rollbackCreatedUser(userHandle);
@@ -507,6 +532,7 @@ router.post('/complete-registration', async (req, res) => {
 
         return res.json({ success: true, handle: userHandle });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] Complete OAuth registration error:', error);
         return res.status(500).json({ error: '注册失败' });
     }
@@ -655,6 +681,11 @@ router.get('/:provider/callback', async (req, res) => {
         loginSession(req, userHandle, record, { provider, membership, tokens });
         return res.redirect('/');
     } catch (error) {
+        if (isStoreUnavailableError(error)) {
+            // No account was created or linked; the login page asks to retry later
+            console.error(`[STC-MOD] OAuth ${logLabel} callback refused: data store unavailable (${error.detail || error.message})`);
+            return redirectOauthError(res, 'server_error');
+        }
         console.error(`[STC-MOD] OAuth ${logLabel} callback error:`, error);
         return redirectOauthError(res, 'server_error');
     }

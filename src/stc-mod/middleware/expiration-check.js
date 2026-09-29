@@ -2,9 +2,12 @@
  * SillyTavernchat Module - User Expiration Check Middleware
  * Checks if the logged-in user's account has expired.
  * Must be registered AFTER setUserDataMiddleware.
+ * While the user metadata cannot be read it fails closed: 503 STORE_UNAVAILABLE for non-admin
+ * users (only when the invitation code system is on; admins are never checked).
  */
 import { isUserExpired, getUserMeta } from '../user-metadata.js';
 import { getStcConfig } from '../config.js';
+import { respondStoreError } from '../services/json-store.js';
 
 /**
  * Express middleware that checks user account expiration.
@@ -28,8 +31,17 @@ export function expirationCheckMiddleware(req, res, next) {
         return next();
     }
 
-    if (isUserExpired(handle)) {
-        const meta = getUserMeta(handle);
+    let expired;
+    let meta;
+    try {
+        expired = isUserExpired(handle);
+        meta = getUserMeta(handle);
+    } catch (error) {
+        if (respondStoreError(req, res, error)) return;
+        throw error;
+    }
+
+    if (expired) {
         const purchaseLink = getStcConfig('purchaseLink', '');
 
         // Clear session to force re-login
@@ -47,6 +59,6 @@ export function expirationCheckMiddleware(req, res, next) {
     }
 
     // Attach extended metadata to request for downstream use
-    req.stcUserMeta = getUserMeta(handle);
+    req.stcUserMeta = meta;
     next();
 }

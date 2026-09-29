@@ -1681,7 +1681,7 @@ async function loadStorageAnalysis(page, sortBy = 'name') {
             if (!r.ok) throw new Error(await r.text());
             const result = await r.json();
             _allStorageData = result.data || result;
-            renderStorageAnalysis({ data: _allStorageData, total: _allStorageData.length }, sortBy);
+            renderStorageAnalysis({ data: _allStorageData, total: _allStorageData.length, pendingCount: result.pendingCount }, sortBy);
         } else {
             // Normal backend pagination for name/storage sorting
             const params = new URLSearchParams({
@@ -1732,19 +1732,19 @@ function renderStorageAnalysis(result, sortBy = 'name') {
         const start = (currentStoragePage - 1) * STORAGE_PER_PAGE;
         const data = allData.slice(start, start + STORAGE_PER_PAGE);
 
-        const pageMiB = data.reduce((s, u) => s + u.totalMiB, 0).toFixed(2);
-        renderStorageTable(data, total, totalPages, currentStoragePage, pageMiB, sortBy);
+        const pageMiB = data.reduce((s, u) => s + (u.totalMiB || 0), 0).toFixed(2);
+        renderStorageTable(data, total, totalPages, currentStoragePage, pageMiB, sortBy, result.pendingCount);
     } else {
         // Backend pagination
         const data = allData;
         const totalPages = Array.isArray(result) ? 1 : (result.totalPages || 1);
         const curPage = Array.isArray(result) ? 1 : (result.page || 1);
-        const pageMiB = data.reduce((s, u) => s + u.totalMiB, 0).toFixed(2);
-        renderStorageTable(data, total, totalPages, curPage, pageMiB, sortBy);
+        const pageMiB = data.reduce((s, u) => s + (u.totalMiB || 0), 0).toFixed(2);
+        renderStorageTable(data, total, totalPages, curPage, pageMiB, sortBy, result.pendingCount);
     }
 }
 
-function renderStorageTable(data, total, totalPages, curPage, pageMiB, sortBy) {
+function renderStorageTable(data, total, totalPages, curPage, pageMiB, sortBy, pendingCount = 0) {
     const container = document.getElementById('stc-ua-list');
     if (!container) return;
 
@@ -1790,7 +1790,7 @@ function renderStorageTable(data, total, totalPages, curPage, pageMiB, sortBy) {
                     style="width:15px;height:15px;cursor:pointer;accent-color:#6c63ff">
             </td>
             <td style="padding:8px 10px;font-weight:600">${esc(u.handle)}</td>
-            <td style="padding:8px 10px;text-align:right;color:#eee;font-weight:600">${u.totalMiB} MiB</td>
+            <td style="padding:8px 10px;text-align:right;color:#eee;font-weight:600">${u.totalMiB == null ? `<span style="color:#888;font-weight:400" title="${u.pending ? '占用仍在后台统计，稍后刷新' : '占用暂时无法统计（存储读取失败）'}">${u.pending ? '统计中…' : '未知'}</span>` : `${u.totalMiB} MiB`}</td>
             <td style="padding:8px 10px;text-align:right;color:#aaa">${c.chats || 0}</td>
             <td style="padding:8px 10px;text-align:right;color:#aaa">${c.characters || 0}</td>
             <td style="padding:8px 10px;text-align:right;color:${backupMiB > 10 ? '#f39c12' : '#aaa'}"
@@ -1851,6 +1851,7 @@ function renderStorageTable(data, total, totalPages, curPage, pageMiB, sortBy) {
             </span>
             <span>显示 <strong style="color:#eee">${startIdx}–${endIdx}</strong></span>
             <span>本页占用 <strong style="color:#eee">${pageMiB} MiB</strong></span>
+            ${pendingCount > 0 ? `<span style="color:#f39c12"><i class="fa-solid fa-spinner fa-spin"></i> ${pendingCount} 个用户的占用仍在后台统计，稍后刷新可查看</span>` : ''}
         </div>
         ${pager}
         <div style="overflow-x:auto;margin-top:8px">

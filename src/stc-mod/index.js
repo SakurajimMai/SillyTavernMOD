@@ -9,10 +9,17 @@
  * - configureTrustProxy(app) -> Reverse proxy trust (before cookie-session)
  * - shouldSkipCsrf(req)    -> CSRF exemption check
  * - setupPublicRoutes(app) -> Password-migration gate, QRole password-login gate,
- *                             QRole session guard, settings.json safeguard, page routes incl.
- *                             the QRole export-only page (before official routes and login middleware)
+ *                             QRole session guard, settings.json safeguard, vault store check of
+ *                             API key writes, page routes incl. the QRole export-only page
+ *                             (before official routes and login middleware)
  * - setupPublicApi(app)    -> Public API routes (no auth required)
- * - setupPrivateRoutes(app)-> Private API routes (auth required)
+ * - setupPrivateRoutes(app)-> Private API routes (auth required) + the STORE_UNAVAILABLE error handler
+ *
+ * Store failures (services/json-store.js): at load the data root guard records the data root device
+ * (and the watchdog, config.yaml `stcDataRootWatchdog`, default true, a worker thread, exits the
+ * process when a mounted data root disappears or was unusable at startup, and kills it when the
+ * mount hangs). A StoreUnavailableError anywhere in an STC route answers 503
+ * `{ error: '数据存储暂时不可用，请稍后重试', code: 'STORE_UNAVAILABLE' }` (pages: a short 503 text).
  */
 import path from 'node:path';
 import express from 'express';
@@ -24,6 +31,17 @@ import { getIpAddress, retryAfter } from '../express-common.js';
 import { getConfigValue } from '../util.js';
 import { DEFAULT_USER } from '../constants.js';
 import { ensureDefaultConfig, getStcConfig, getStcDataDir } from './config.js';
+import {
+    initDataRootGuard,
+    respondStoreError,
+    startDataRootWatchdog,
+    storeErrorHandler,
+} from './services/json-store.js';
+import {
+    VaultRecordCorruptError,
+    getVaultStatus,
+    isVaultProtectedKey,
+} from './services/privacy-vault.js';
 import { configureTrustProxy as applyTrustProxy } from './middleware/trust-proxy.js';
 import { shouldSkipCsrf as csrfCheck } from './middleware/csrf-exemption.js';
 import { expirationCheckMiddleware } from './middleware/expiration-check.js';
@@ -41,11 +59,22 @@ import { sendSitePage } from './services/site-config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Record the data root device before anything is read from it (mount-loss detection);
+// config.yaml `stcDataRootMustBeMount: true` refuses a data root that is not on its own mount
+initDataRootGuard({ requireMount: getStcConfig('stcDataRootMustBeMount', false) === true });
+
 // Ensure default config values on load
 ensureDefaultConfig();
 
-// Ensure data directories exist
-getStcDataDir();
+// Ensure data directories exist (never fatal here: the stores answer 503 while it is not usable)
+try {
+    getStcDataDir();
+} catch (error) {
+    console.error('[STC-MOD] STC data directory is not usable at startup:', error?.detail || error?.message);
+}
+
+// Exit (Docker restarts the container) when a mounted data root disappears
+startDataRootWatchdog({ enabled: getStcConfig('stcDataRootWatchdog', true) !== false });
 
 /**
  * Reverse proxy trust - called from server-main.js before cookie-session
@@ -96,12 +125,15 @@ async function rejectLogin(req, res, message) {
  * does (`storage.getItem(toKey(request.body.handle))`). Metadata left behind by a deleted account
  * whose handle was re-used is ignored.
  * @param {*} rawHandle `request.body.handle`
- * @returns {Promise<object|null>} Metadata of the account the login targets
+ * @returns {Promise<{record: object|null, meta: object|null}>} Record and metadata of the account the login targets
+ * @throws {import('./services/json-store.js').StoreUnavailableError} The metadata cannot be read
  */
-async function getLoginTargetMeta(rawHandle) {
+async function getLoginTarget(rawHandle) {
     const handle = String(rawHandle);
     const record = await storage.getItem(toKey(handle));
-    return liveMetaForRecord(getUserMeta(handle), record);
+    // No account: nothing to look up (the official login rejects it)
+    if (!record) return { record: null, meta: null };
+    return { record, meta: liveMetaForRecord(getUserMeta(handle), record) };
 }
 
 /**
@@ -129,11 +161,14 @@ async function qroleLoginGate(req, res, next) {
         // Let the official handler reject missing handles
         if (rawHandle === undefined || rawHandle === null || rawHandle === '') return next();
 
-        const meta = await getLoginTargetMeta(rawHandle);
-        if (isPasswordLoginAllowed(meta)) return next();
+        // Fails closed: while the metadata cannot be read nobody can tell whether the account is a
+        // QRole member account, so password logins answer 503 (the gate never lets them through)
+        const { record, meta } = await getLoginTarget(rawHandle);
+        if (!record || isPasswordLoginAllowed(meta)) return next();
 
         return rejectLogin(req, res, 'QRole 会员账号请使用 QRole 登录');
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole login gate error:', error);
         return res.status(500).json({ error: 'Internal server error' });
     }
@@ -162,6 +197,28 @@ async function passwordlessLoginGate(req, res, next) {
     } catch (error) {
         console.error('[STC-MOD] Passwordless login gate error:', error);
         return res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
+/**
+ * Saving an API key (official POST /api/secrets/write) reads the user's vault record to decide
+ * whether the key must be encrypted. Check that record first: when it cannot be read the save
+ * answers 503 (or 500 VAULT_RECORD_CORRUPT) here, instead of an opaque 500 from the official route,
+ * and the key is never stored as if the vault were not enabled.
+ * @type {import('express').RequestHandler}
+ */
+function vaultStoreCheck(req, res, next) {
+    const key = req.body?.key;
+    if (!req.user?.directories || typeof key !== 'string' || !isVaultProtectedKey(key)) return next();
+    try {
+        getVaultStatus(req.user.directories);
+        return next();
+    } catch (error) {
+        if (respondStoreError(req, res, error)) return;
+        if (error instanceof VaultRecordCorruptError) {
+            return res.status(500).json({ error: true, code: error.code, message: error.message });
+        }
+        return next();
     }
 }
 
@@ -207,6 +264,11 @@ export async function setupPublicRoutes(app) {
     // (setUserDataMiddleware already ran, so req.user is set)
     app.use(qroleSessionGuard);
 
+    // API key saves: an unreadable vault record answers 503 instead of saving the key unencrypted
+    const secretsGuard = express.Router();
+    secretsGuard.post('/write', vaultStoreCheck);
+    app.use('/api/secrets', secretsGuard);
+
     // Recreate a missing settings.json before the official POST /api/settings/get reads it
     // (account reset with `skipContentCheck: true` leaves the user without one -> HTTP 500).
     // Mounted like the official settings router so every path variant it accepts is covered.
@@ -226,11 +288,16 @@ export async function setupPublicRoutes(app) {
     // Welcome page (+ expiry enforcement for logged-in users)
     app.get('/', (req, res, next) => {
         if (req.session?.handle) {
-            // If invitation code system is enabled, kick expired users back to login
-            if (getStcConfig('enableInvitationCodes', false) && isUserExpired(req.session.handle)) {
-                const handle = req.session.handle;
-                req.session = null; // destroy session
-                return res.redirect(`/login?reason=expired&handle=${encodeURIComponent(handle)}`);
+            try {
+                // If invitation code system is enabled, kick expired users back to login
+                // (metadata unavailable: 503 page via the error handler, the session is kept)
+                if (getStcConfig('enableInvitationCodes', false) && isUserExpired(req.session.handle)) {
+                    const handle = req.session.handle;
+                    req.session = null; // destroy session
+                    return res.redirect(`/login?reason=expired&handle=${encodeURIComponent(handle)}`);
+                }
+            } catch (error) {
+                return next(error);
             }
             return next();
         }
@@ -373,6 +440,10 @@ export async function setupPrivateRoutes(app) {
     const { router: qroleAccountsRouter } = await import('./routes/private/qrole-accounts.js');
     app.use('/api/stc/qrole-accounts', qroleAccountsRouter);
     startQroleCleanupScheduler();
+
+    // Last: StoreUnavailableError thrown (or passed to next) by any route above -> HTTP 503
+    // STORE_UNAVAILABLE (JSON for /api/, a short text for pages); other errors keep the default handling
+    app.use(storeErrorHandler);
 
     console.log('[STC-MOD] Private API routes registered.');
 }

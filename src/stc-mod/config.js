@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import yaml from 'yaml';
+import { StoreUnavailableError, assertDataRootAvailable } from './services/json-store.js';
 
 let cachedConfig = null;
 // Identity of the file the cache was read from (the atomic writer replaces the inode on every save)
@@ -414,10 +415,29 @@ export function getDataRoot() {
     return globalThis.DATA_ROOT || path.join(process.cwd(), 'data');
 }
 
+/**
+ * STC data directory (`<data root>/stc-mod`), created when missing.
+ * Refuses (StoreUnavailableError) while the data root mount is gone, so nothing is created on the
+ * empty filesystem underneath it; any other error than ENOENT is StoreUnavailableError as well.
+ * @returns {string}
+ */
 export function getStcDataDir() {
+    assertDataRootAvailable();
     const dir = path.join(getDataRoot(), 'stc-mod');
-    if (!fs.existsSync(dir)) {
+    try {
+        if (fs.statSync(dir).isDirectory()) return dir;
+        throw Object.assign(new Error(`${dir} is not a directory`), { code: 'ENOTDIR' });
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            throw new StoreUnavailableError(`STC data directory ${dir} is not usable (${error?.code || error?.message})`, { cause: error });
+        }
+    }
+    // ENOENT: the mount may have vanished since the first check; never create it underneath
+    assertDataRootAvailable();
+    try {
         fs.mkdirSync(dir, { recursive: true });
+    } catch (error) {
+        throw new StoreUnavailableError(`STC data directory ${dir} could not be created (${error?.code || error?.message})`, { cause: error });
     }
     return dir;
 }

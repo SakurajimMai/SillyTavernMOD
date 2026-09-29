@@ -12,15 +12,26 @@
  * run). At most 20 accounts are deleted per run; the job runs at most once per 24 h.
  * Run state lives in `stc-mod/qrole-cleanup-state.json`, deletions are logged to
  * `stc-mod/qrole-cleanup-log.json` (last 200 entries) under the STC data dir.
+ * Store failures (services/json-store.js): a run only starts when the data root, the user metadata
+ * and the state file are readable (otherwise it is skipped and retried by the next hourly check);
+ * right before each deletion the data root guard is checked again, and a run that hits an
+ * unavailable store stops without deleting anything else (and without recording a finished run).
  */
-import fs from 'node:fs';
 import path from 'node:path';
 import storage from 'node-persist';
 import { toKey } from '../../users.js';
 import { getStcDataDir } from '../config.js';
-import { getAllUserMeta } from '../user-metadata.js';
+import { ensureUserMetadataLoaded, getAllUserMeta } from '../user-metadata.js';
+import {
+    assertDataRootAvailable,
+    createJsonStore,
+    isPlainObject,
+    isStoreUnavailableError,
+    readJsonFile,
+    writeJsonFileAtomic,
+} from './json-store.js';
 import { isMetaForRecord } from './account-security.js';
-import { calculateUserStorageAsync } from './storage-quota.js';
+import { getUserUsage, getUsersUsage, invalidateUserUsage } from './storage-quota.js';
 import { deleteUserWithLock } from './user-deletion.js';
 import { loadLiveQroleAccount, verifyQroleMembership } from './qrole-reverify.js';
 import { isTokenKeyAvailable } from './qrole-token-crypto.js';
@@ -48,8 +59,9 @@ const MAX_CONSECUTIVE_TRANSIENT = 3;
 const RUN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const INITIAL_CHECK_DELAY_MS = 5 * 60 * 1000;
-const STORAGE_CACHE_TTL_MS = 10 * 60 * 1000;
-const STORAGE_CONCURRENCY = 4;
+// Storage sizes come from the shared usage cache (storage-quota.js: fresh for 10 min, single-flight,
+// bounded concurrency); lists wait at most this long for a single account's count
+const STORAGE_WAIT_MS = 5000;
 const RECORD_CONCURRENCY = 8;
 const STATE_FILE = 'qrole-cleanup-state.json';
 const LOG_FILE = 'qrole-cleanup-log.json';
@@ -57,8 +69,6 @@ const MAX_LOG_ENTRIES = 200;
 const MAX_RESULT_DETAILS = 50;
 const DEFAULT_USER_HANDLE = 'default-user';
 
-/** @type {Map<string, {bytes: number|null, at: number}>} */
-const storageCache = new Map();
 /** @type {Promise<CleanupResult>|null} */
 let runningCleanup = null;
 /** @type {number|null} When the running cleanup started */
@@ -113,55 +123,51 @@ let schedulerStarted = false;
  * @property {CleanupDeletion[]} deleted
  * @property {{handle: string, reason: string}[]} skipped
  * @property {{handle: string, error: string}[]} failed
- * @property {'disabled'} [stopped] Set when the run ended early because cleanup (or the membership
- *   gate) was switched off while it was running
+ * @property {'disabled'|'store_unavailable'} [stopped] Set when the run ended early because cleanup
+ *   (or the membership gate) was switched off while it was running, or a data store became unavailable
  * @property {string} [error] Set when the run itself failed
  */
 
+const STORE_UNAVAILABLE_RUN_ERROR = '数据存储暂时不可用，清理已中止（未删除其余账号），将在下次检查时重试';
+
 /**
- * Read a JSON file from the STC data dir.
- * @param {string} fileName
- * @param {*} fallback
- * @returns {*}
+ * Run state (`qrole-cleanup-state.json`) from disk.
+ * @returns {object|null} null when there is none (missing or unreadable content, kept as `.corrupt-*`)
+ * @throws {import('./json-store.js').StoreUnavailableError}
  */
-function readDataFile(fileName, fallback) {
-    try {
-        return JSON.parse(fs.readFileSync(path.join(getStcDataDir(), fileName), 'utf8'));
-    } catch {
-        return fallback;
-    }
+function readStateFile() {
+    const result = readJsonFile(path.join(getStcDataDir(), STATE_FILE), { validate: isPlainObject, backup: false, label: 'QRole cleanup state' });
+    return result.status === 'ok' || result.status === 'recovered' ? result.data : null;
 }
 
 /**
- * Atomically write a JSON file to the STC data dir (temp file + rename).
- * @param {string} fileName
- * @param {*} data
- * @returns {boolean}
+ * Write the run state (best effort: a failure is logged, memoryLastRunAt still throttles the scheduler).
+ * @param {object} data
  */
-function writeDataFile(fileName, data) {
-    const filePath = path.join(getStcDataDir(), fileName);
-    const tmpPath = `${filePath}.${process.pid}.tmp`;
+function writeStateFile(data) {
     try {
-        fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-        fs.renameSync(tmpPath, filePath);
-        return true;
+        writeJsonFileAtomic(path.join(getStcDataDir(), STATE_FILE), data);
     } catch (error) {
-        console.error(`[STC-MOD] Failed to write ${fileName}:`, error?.message);
-        try {
-            fs.rmSync(tmpPath, { force: true });
-        } catch {
-            // Ignore cleanup errors
-        }
-        return false;
+        console.error(`[STC-MOD] Failed to write ${STATE_FILE}:`, error?.detail || error?.message);
     }
 }
+
+/** Deletion log (`qrole-cleanup-log.json`, JSON array). */
+const cleanupLogStore = createJsonStore({
+    label: 'QRole cleanup log',
+    file: () => path.join(getStcDataDir(), LOG_FILE),
+    validate: Array.isArray,
+    empty: () => [],
+    backup: false,
+});
 
 /**
  * Last cleanup run.
  * @returns {{lastRunAt: number|null, lastResult: CleanupResult|null}}
+ * @throws {import('./json-store.js').StoreUnavailableError} The state file cannot be read
  */
 export function readCleanupState() {
-    const state = readDataFile(STATE_FILE, null);
+    const state = readStateFile();
     const fileRunAt = toTimestamp(state?.lastRunAt);
     const lastRunAt = Math.max(fileRunAt ?? 0, memoryLastRunAt) || null;
     const lastResult = state?.lastResult && typeof state.lastResult === 'object' ? state.lastResult : null;
@@ -171,13 +177,23 @@ export function readCleanupState() {
 /**
  * Append deletions to the cleanup log (keeps the last 200 entries).
  * @param {CleanupDeletion[]} entries
+ * @throws {import('./json-store.js').StoreUnavailableError}
  */
 function appendCleanupLog(entries) {
     if (!entries.length) return;
-    const current = readDataFile(LOG_FILE, []);
-    const log = Array.isArray(current) ? current : [];
-    log.push(...entries);
-    writeDataFile(LOG_FILE, log.slice(-MAX_LOG_ENTRIES));
+    cleanupLogStore.update((log) => {
+        log.push(...entries);
+        if (log.length > MAX_LOG_ENTRIES) log.splice(0, log.length - MAX_LOG_ENTRIES);
+    });
+}
+
+/**
+ * Throw StoreUnavailableError unless the stores a cleanup run relies on can be read.
+ */
+function assertCleanupStoresAvailable() {
+    assertDataRootAvailable();
+    ensureUserMetadataLoaded();
+    readStateFile();
 }
 
 /**
@@ -202,17 +218,25 @@ async function mapWithConcurrency(items, limit, fn) {
 }
 
 /**
- * Storage used by an account (cached for 10 minutes; null when unknown).
+ * Storage used by an account (shared usage cache; null when unknown or still being counted).
  * @param {string} handle
- * @param {boolean} [fresh] Bypass the cache
+ * @param {boolean} [fresh] Count now (joins a running count) and wait for it
  * @returns {Promise<number|null>}
  */
 async function getStorageBytes(handle, fresh = false) {
-    const cached = storageCache.get(handle);
-    if (!fresh && cached && Date.now() - cached.at < STORAGE_CACHE_TTL_MS) return cached.bytes;
-    const bytes = await calculateUserStorageAsync(handle);
-    storageCache.set(handle, { bytes, at: Date.now() });
-    return bytes;
+    const usage = await getUserUsage(handle, fresh ? { maxAgeMs: 0 } : { waitMs: STORAGE_WAIT_MS });
+    return usage.bytes;
+}
+
+/**
+ * Storage used by several accounts for admin lists (bounded concurrency; partial results after the
+ * list deadline: accounts still being counted are null).
+ * @param {string[]} handles
+ * @returns {Promise<(number|null)[]>} Aligned with `handles`
+ */
+async function getStorageBytesMany(handles) {
+    const usage = await getUsersUsage(handles);
+    return handles.map(handle => usage.get(handle)?.bytes ?? null);
 }
 
 /**
@@ -309,7 +333,7 @@ export async function listQroleAccounts() {
     const cfg = getQroleConfig();
     const lifecycle = resolveQroleLifecycleConfig(cfg);
     const accounts = await collectQroleAccounts();
-    const sizes = await mapWithConcurrency(accounts, STORAGE_CONCURRENCY, account => getStorageBytes(account.handle));
+    const sizes = await getStorageBytesMany(accounts.map(account => account.handle));
     const now = Date.now();
     const entries = accounts.map((account, index) => buildAccountEntry(account, cfg, lifecycle, now, sizes[index]));
     entries.sort(compareEntries);
@@ -365,7 +389,7 @@ export async function previewQroleCleanup() {
         .map(account => ({ account, eligibility: getCleanupEligibility(account.meta, cfg, lifecycle, now) }))
         .filter(item => item.eligibility.eligible)
         .sort((a, b) => Number(a.eligibility.cleanupAt) - Number(b.eligibility.cleanupAt));
-    const sizes = await mapWithConcurrency(due, STORAGE_CONCURRENCY, item => getStorageBytes(item.account.handle));
+    const sizes = await getStorageBytesMany(due.map(item => item.account.handle));
     // Same condition as the run: a stored token is always checked first (the account is skipped,
     // never deleted, when it cannot be checked, e.g. without a usable key file)
     const verifyOn = isRefreshTokenFeatureOn(lifecycle);
@@ -517,6 +541,11 @@ async function executeCleanup(trigger) {
                 const deletion = await deleteUserWithLock(handle, {
                     // Final check under the deletion lock (logins of this account wait for it)
                     precheck: async () => {
+                        try {
+                            assertDataRootAvailable();
+                        } catch {
+                            return 'store_unavailable';
+                        }
                         const latest = readRunSettings();
                         const live = await loadLiveQroleAccount(handle);
                         const { veto, eligibility: latestEligibility } = checkCleanupStillDue({
@@ -531,6 +560,11 @@ async function executeCleanup(trigger) {
                     },
                 });
                 if (deletion.skipped) {
+                    if (deletion.skipped === 'store_unavailable') {
+                        result.stopped = 'store_unavailable';
+                        result.remaining = due.length - i;
+                        break;
+                    }
                     skip(handle, deletion.skipped);
                     if (deletion.skipped === 'cleanup_disabled') {
                         result.stopped = 'disabled';
@@ -539,7 +573,7 @@ async function executeCleanup(trigger) {
                     }
                     continue;
                 }
-                storageCache.delete(handle);
+                invalidateUserUsage(handle);
                 if (!deletion.success) {
                     result.failed.push({ handle, error: deletion.error || 'Unknown error' });
                     continue;
@@ -558,25 +592,50 @@ async function executeCleanup(trigger) {
                     trigger,
                 };
                 result.deleted.push(entry);
-                appendCleanupLog([entry]);
+                try {
+                    appendCleanupLog([entry]);
+                } catch (logError) {
+                    // The account is gone either way; an unavailable store stops the run below
+                    console.error(`[STC-MOD] QRole cleanup could not log the deletion of ${handle}:`, logError?.detail || logError?.message);
+                    if (isStoreUnavailableError(logError)) {
+                        result.stopped = 'store_unavailable';
+                        result.remaining = due.length - i - 1;
+                        break;
+                    }
+                }
                 const expiry = entry.expiresAt ? new Date(entry.expiresAt).toISOString() : 'none';
                 const size = storageBytes === null ? 'unknown' : `${Math.round(storageBytes / 1024 / 1024 * 100) / 100} MiB`;
                 console.log(`[STC-MOD] QRole cleanup deleted account ${handle} (reason: ${entry.reason}, membership expiry: ${expiry}, storage: ${size}, verify: ${verify ?? 'no token'})`);
             } catch (error) {
+                if (isStoreUnavailableError(error)) {
+                    result.stopped = 'store_unavailable';
+                    result.remaining = due.length - i;
+                    break;
+                }
                 result.failed.push({ handle, error: error?.message || 'Unknown error' });
             }
         }
     } catch (error) {
-        result.error = error?.message || 'Unknown error';
-        console.error('[STC-MOD] QRole cleanup run failed:', result.error);
+        if (isStoreUnavailableError(error)) {
+            result.stopped = 'store_unavailable';
+        } else {
+            result.error = error?.message || 'Unknown error';
+            console.error('[STC-MOD] QRole cleanup run failed:', result.error);
+        }
     }
 
     result.finishedAt = Date.now();
     result.deletedCount = result.deleted.length;
     result.skippedCount = result.skipped.length;
     result.failedCount = result.failed.length;
+    if (result.stopped === 'store_unavailable') {
+        // Not recorded as a finished run: the next hourly check tries again
+        result.error = STORE_UNAVAILABLE_RUN_ERROR;
+        console.error(`[STC-MOD] QRole cleanup (${trigger}) stopped: a data store is unavailable (${result.deletedCount} deleted before that); retrying with the next check`);
+        return result;
+    }
     memoryLastRunAt = startedAt;
-    writeDataFile(STATE_FILE, { lastRunAt: startedAt, lastResult: summarizeResult(result) });
+    writeStateFile({ lastRunAt: startedAt, lastResult: summarizeResult(result) });
     if (result.candidates > 0 || result.error) {
         const stopped = result.stopped ? ' (stopped: cleanup was switched off)' : '';
         console.log(`[STC-MOD] QRole cleanup (${trigger}): ${result.deletedCount} deleted, ${result.skippedCount} skipped, ${result.failedCount} failed, ${result.remaining} left for the next run${stopped}`);
@@ -590,12 +649,16 @@ async function executeCleanup(trigger) {
  *   as the run started (the admin panel then polls the account list for `cleanup.running` and the
  *   last result, so a long run never hits a reverse-proxy timeout)
  * @returns {Promise<{started: false, reason: 'running'|'disabled'|'membership_not_required'}|{started: true, result: CleanupResult}|{started: true, background: true, startedAt: number}>}
+ * @throws {import('./json-store.js').StoreUnavailableError} The data root, the user metadata or the
+ *   state file cannot be read (the run was not started)
  */
 export async function runQroleCleanup({ trigger = 'manual', background = false } = {}) {
     if (runningCleanup) return { started: false, reason: 'running' };
     const lifecycle = resolveQroleLifecycleConfig(getQroleConfig());
     if (!lifecycle.requireMembership) return { started: false, reason: 'membership_not_required' };
     if (!lifecycle.expiredCleanup.enabled) return { started: false, reason: 'disabled' };
+    // Throws StoreUnavailableError (run skipped, nothing recorded) when a store cannot be read
+    assertCleanupStoresAvailable();
 
     const startedAt = Date.now();
     runningSince = startedAt;
@@ -634,7 +697,7 @@ export function startQroleCleanupScheduler() {
     if (schedulerStarted) return;
     schedulerStarted = true;
     const tick = () => {
-        scheduledTick().catch(error => console.error('[STC-MOD] QRole cleanup scheduler error:', error?.message || error));
+        scheduledTick().catch(error => console.error('[STC-MOD] QRole cleanup scheduler error (retrying with the next check):', error?.detail || error?.message || error));
     };
     setTimeout(tick, INITIAL_CHECK_DELAY_MS).unref();
     setInterval(tick, CHECK_INTERVAL_MS).unref();

@@ -2,9 +2,18 @@
  * SillyTavernchat Module - Register Helper
  * Creates users by directly calling the official SillyTavern user storage APIs.
  * This avoids going through HTTP and requiring admin auth.
+ *
+ * Store failures: the data root guard and the user metadata are checked BEFORE the official record
+ * is created, so an unavailable store never leaves an account without its metadata (or, for OAuth,
+ * creates a second account for an identity whose link just cannot be read). Right before the record
+ * is written (after the awaits of the free-handle check) the handle is verified again with the guard
+ * checked around a fresh read (isAccountRecordGone): a check that ran against a vanished mount (every
+ * record ENOENT, no user directory) never lets a new account overwrite an existing one or drop its
+ * metadata.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import storage from 'node-persist';
 import lodash from 'lodash';
 import {
@@ -15,11 +24,18 @@ import {
     getUserDirectories,
     ensurePublicDirectoriesExist,
 } from '../../../users.js';
-import { deleteUserMeta, findUserByOAuth, getUserMeta, setUserMeta } from '../../user-metadata.js';
+import { deleteUserMeta, ensureUserMetadataLoaded, findUserByOAuth, getUserMeta, setUserMeta } from '../../user-metadata.js';
 import { applyRandomPassword, OAUTH_PROVIDERS } from '../../services/account-security.js';
 import { getDefaultLimitMiB, isStorageLimitEnabled } from '../../services/storage-quota.js';
 import { applyTemplate, getTemplateMeta } from '../../services/default-template.js';
 import { seedNewUserContent } from '../../services/user-content-seed.js';
+import { getDataRoot } from '../../config.js';
+import {
+    STORE_UNAVAILABLE_MESSAGE,
+    StoreUnavailableError,
+    assertDataRootAvailable,
+    isStoreUnavailableError,
+} from '../../services/json-store.js';
 
 /** Handles that self-registration (local or OAuth) may never claim. */
 export const WEAK_NAMES = Object.freeze(['admin', 'root', 'system', 'test', 'null', 'undefined', 'default', 'default-user']);
@@ -70,6 +86,35 @@ function isHandleAvailable(handle, takenHandles) {
 }
 
 /**
+ * Whether the official account record of `handle` is really absent. node-persist reads ENOENT as
+ * "no record", and while the data root mount is gone every record is ENOENT: the data root guard is
+ * checked before and after a fresh read, and the record directory (created at startup) must exist.
+ * Use before acting on a missing record (clearing an OAuth link, taking over a handle).
+ * @param {string} handle
+ * @returns {Promise<boolean>}
+ * @throws {StoreUnavailableError} The data root or the record directory is not available
+ */
+export async function isAccountRecordGone(handle) {
+    assertDataRootAvailable();
+    const recordDir = path.join(getDataRoot(), '_storage');
+    let stat;
+    try {
+        stat = await fs.promises.stat(recordDir);
+    } catch (error) {
+        throw new StoreUnavailableError(`account records ${recordDir} cannot be stat'ed (${error?.code || error?.message})`, { cause: error });
+    }
+    if (!stat.isDirectory()) throw new StoreUnavailableError(`account records ${recordDir} is not a directory`);
+    let record;
+    try {
+        record = await storage.getItem(toKey(handle));
+    } catch (error) {
+        throw new StoreUnavailableError(`account record of ${handle} cannot be read (${error?.code || error?.message})`, { cause: error });
+    }
+    assertDataRootAvailable();
+    return !record;
+}
+
+/**
  * Drop metadata left behind for a handle that has no official record (e.g. the account was
  * deleted through the official admin API). Must only be called right after the handle was
  * verified free, so stale OAuth links / expiry / quota are never inherited by a new account.
@@ -100,7 +145,8 @@ async function ensureUserDirectories(handle) {
  * @param {string} handle User handle (will be slugified)
  * @param {string} name Display name
  * @param {string} password Password (empty string for no password)
- * @returns {Promise<{success: boolean, handle?: string, error?: string}>}
+ * @returns {Promise<{success: boolean, handle?: string, error?: string, unavailable?: boolean}>}
+ *   `unavailable`: a data store could not be read, nothing was created (error = the zh-CN 503 text)
  */
 export async function createUser(handle, name, password = '') {
     try {
@@ -111,7 +157,14 @@ export async function createUser(handle, name, password = '') {
         }
 
         const created = await withHandleLock(async () => {
+            // Before anything is created: the metadata written right after must be available
+            assertDataRootAvailable();
+            ensureUserMetadataLoaded();
             if (!isHandleAvailable(slugHandle, new Set(await getAllUserHandles()))) {
+                return false;
+            }
+            // Again right before the write: the checks above may have run against a vanished mount
+            if (!await isAccountRecordGone(slugHandle) || !isHandleAvailable(slugHandle, new Set())) {
                 return false;
             }
 
@@ -147,6 +200,10 @@ export async function createUser(handle, name, password = '') {
 
         return { success: true, handle: slugHandle };
     } catch (error) {
+        if (isStoreUnavailableError(error)) {
+            console.error('[STC-MOD] Create user refused: data store unavailable', error.detail || error.message);
+            return { success: false, error: STORE_UNAVAILABLE_MESSAGE, unavailable: true };
+        }
         console.error('[STC-MOD] Create user failed:', error);
         return { success: false, error: '创建用户失败' };
     }
@@ -204,6 +261,8 @@ function pickFreeHandle(candidates, isFree) {
  * @param {string} [identity.avatar] Avatar URL
  * @param {object} [identity.extraMeta] Extra metadata to store (e.g. qroleTier, qroleMembershipExpiresAt)
  * @returns {Promise<{success: boolean, handle?: string, error?: string, conflict?: boolean}>}
+ * @throws {import('../../services/json-store.js').StoreUnavailableError} The OAuth links cannot be
+ *   read (nothing was created)
  */
 export async function createOAuthUser({ provider, id, username, displayName, email, avatar, extraMeta } = {}) {
     const providerStr = String(provider ?? '');
@@ -214,7 +273,9 @@ export async function createOAuthUser({ provider, id, username, displayName, ema
 
     try {
         const outcome = await withHandleLock(async () => {
+            assertDataRootAvailable();
             // Re-check under the lock: a concurrent callback may have linked this identity already
+            // (throws while the metadata is unavailable: never a second account for a linked identity)
             if (findUserByOAuth(providerStr, idStr)) {
                 return { error: '该第三方账号已绑定其他账户', conflict: true };
             }
@@ -224,6 +285,14 @@ export async function createOAuthUser({ provider, id, username, displayName, ema
             const handle = pickFreeHandle(candidates, candidate => isHandleAvailable(candidate, taken));
             if (!handle) {
                 return { error: '无法分配用户标识，请稍后重试' };
+            }
+            // Again right before the write: the checks above may have run against a vanished mount
+            // (the record would overwrite an existing account and drop its metadata)
+            if (!await isAccountRecordGone(handle) || !isHandleAvailable(handle, new Set())) {
+                return { error: '无法分配用户标识，请稍后重试' };
+            }
+            if (findUserByOAuth(providerStr, idStr)) {
+                return { error: '该第三方账号已绑定其他账户', conflict: true };
             }
 
             const now = Date.now();
@@ -271,18 +340,19 @@ export async function createOAuthUser({ provider, id, username, displayName, ema
             throw error;
         }
 
-        if (getTemplateMeta()) {
-            try {
+        try {
+            if (getTemplateMeta()) {
                 await applyTemplate(outcome.handle, { displayName: outcome.name });
-            } catch (error) {
-                // Template application is optional; do not block OAuth registration
-                console.error('[STC-MOD] Apply template failed:', error?.message);
             }
+        } catch (error) {
+            // Template application is optional (also when its store is unavailable); do not block OAuth registration
+            console.error('[STC-MOD] Apply template failed:', error?.detail || error?.message);
         }
 
         console.info(`[STC-MOD] Created ${providerStr} OAuth account:`, outcome.handle);
         return { success: true, handle: outcome.handle };
     } catch (error) {
+        if (isStoreUnavailableError(error)) throw error;
         console.error('[STC-MOD] Create OAuth user failed:', error);
         return { success: false, error: '创建用户失败' };
     }

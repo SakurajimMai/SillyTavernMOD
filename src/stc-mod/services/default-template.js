@@ -1,6 +1,11 @@
 /**
  * SillyTavernchat Module - Default User Template Service
  * Manages default configuration templates that are applied to new users.
+ *
+ * `stc-mod/default-template/template-meta.json` marks that a template exists. It is read with error
+ * classification (services/json-store.js): missing = no template; unparseable = no template (a copy
+ * is kept as `.corrupt-<ts>`); any other error throws StoreUnavailableError (HTTP 503), so an
+ * outage is never reported as "no template".
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,28 +13,73 @@ import storage from 'node-persist';
 import { SETTINGS_FILE, USER_DIRECTORY_TEMPLATE } from '../../constants.js';
 import { toKey } from '../../users.js';
 import { getStcDataDir, getDataRoot } from '../config.js';
+import {
+    StoreUnavailableError,
+    assertDataRootAvailable,
+    isPlainObject,
+    readJsonFile,
+    writeJsonFileAtomic,
+} from './json-store.js';
 
 const DEFAULT_USER_AVATAR = 'user-default.png';
 
 const TEMPLATE_DIR = 'default-template';
+const TEMPLATE_META_FILE = 'template-meta.json';
 
+/**
+ * Template directory path (not created).
+ * @returns {string}
+ */
 function getTemplateDir() {
-    const dir = path.join(getStcDataDir(), TEMPLATE_DIR);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return path.join(getStcDataDir(), TEMPLATE_DIR);
+}
+
+/**
+ * Template directory, created when missing (before writing).
+ * @returns {string}
+ */
+function ensureTemplateDir() {
+    const dir = getTemplateDir();
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+    } catch (error) {
+        throw new StoreUnavailableError(`template directory could not be created (${error?.code || error?.message})`, { cause: error });
+    }
     return dir;
 }
 
 function getTemplateMetaPath() {
-    return path.join(getTemplateDir(), 'template-meta.json');
+    return path.join(getTemplateDir(), TEMPLATE_META_FILE);
 }
 
+/**
+ * @returns {object|null} Template metadata, null when there is no (usable) template
+ * @throws {StoreUnavailableError}
+ */
 function loadTemplateMeta() {
-    const metaPath = getTemplateMetaPath();
-    if (!fs.existsSync(metaPath)) return null;
+    const result = readJsonFile(getTemplateMetaPath(), { validate: isPlainObject, backup: false, label: 'Default template' });
+    if (result.status === 'ok' || result.status === 'recovered') return result.data;
+    if (result.status === 'corrupt') {
+        console.error('[STC-MOD] Default template metadata is unreadable; no template is applied until it is saved again');
+    }
+    return null;
+}
+
+/**
+ * Entries of the template directory (template-meta.json excluded); [] when the directory is missing.
+ * @param {string} templateDir
+ * @param {boolean} [includeMeta]
+ * @returns {string[]}
+ */
+function listTemplateEntries(templateDir, includeMeta = false) {
     try {
-        return JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-    } catch {
-        return null;
+        return fs.readdirSync(templateDir).filter(f => includeMeta || f !== TEMPLATE_META_FILE);
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            assertDataRootAvailable();
+            return [];
+        }
+        throw new StoreUnavailableError(`template directory could not be read (${error?.code || error?.message})`, { cause: error });
     }
 }
 
@@ -49,15 +99,17 @@ export function saveTemplate(sourceHandle, options = {}) {
         includeThemes = true,
     } = options;
 
+    // A lost data root mount must not look like "source user not found" (or be written to)
+    assertDataRootAvailable();
     const sourceDir = path.join(getDataRoot(), sourceHandle);
     if (!fs.existsSync(sourceDir)) {
         throw new Error(`Source user directory not found: ${sourceHandle}`);
     }
 
-    const templateDir = getTemplateDir();
+    const templateDir = ensureTemplateDir();
 
     // Clean existing template
-    const oldFiles = fs.readdirSync(templateDir).filter(f => f !== 'template-meta.json');
+    const oldFiles = listTemplateEntries(templateDir);
     for (const f of oldFiles) {
         const fp = path.join(templateDir, f);
         if (fs.statSync(fp).isDirectory()) {
@@ -107,7 +159,7 @@ export function saveTemplate(sourceHandle, options = {}) {
         options,
         copiedItems: copied,
     };
-    fs.writeFileSync(getTemplateMetaPath(), JSON.stringify(meta, null, 2), 'utf8');
+    writeJsonFileAtomic(getTemplateMetaPath(), meta);
 
     console.log(`[STC-MOD] Default template saved from user: ${sourceHandle}`);
     return meta;
@@ -203,7 +255,7 @@ export async function applyTemplate(targetHandle, { displayName } = {}) {
 
     if (!fs.existsSync(targetDir)) return false;
 
-    const files = fs.readdirSync(templateDir).filter(f => f !== 'template-meta.json');
+    const files = listTemplateEntries(templateDir);
     for (const f of files) {
         const src = path.join(templateDir, f);
         const dst = path.join(targetDir, f);
@@ -226,7 +278,9 @@ export async function applyTemplate(targetHandle, { displayName } = {}) {
 }
 
 /**
- * Get current template metadata
+ * Get current template metadata.
+ * @returns {object|null} null when there is no template
+ * @throws {StoreUnavailableError} The template store cannot be read
  */
 export function getTemplateMeta() {
     return loadTemplateMeta();
@@ -234,10 +288,11 @@ export function getTemplateMeta() {
 
 /**
  * Delete current template
+ * @throws {StoreUnavailableError}
  */
 export function deleteTemplate() {
     const templateDir = getTemplateDir();
-    const files = fs.readdirSync(templateDir);
+    const files = listTemplateEntries(templateDir, true);
     for (const f of files) {
         const fp = path.join(templateDir, f);
         if (fs.statSync(fp).isDirectory()) {

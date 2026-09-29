@@ -12,11 +12,14 @@
  * user's root exists but settings.json is missing, it restores the default settings.json (see
  * user-content-seed.js restoreUserSettings: never the whole ~15 MiB default set, which would be
  * copied synchronously inside the request), then lets the official handler continue. It never
- * throws and has no effect when the file exists or when no user is logged in.
+ * throws and has no effect when the file exists or when no user is logged in. Nothing is restored
+ * while the data root mount is lost (services/json-store.js guard): settings.json is then only
+ * missing because the path resolves to the empty directory underneath.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { SETTINGS_FILE } from '../../constants.js';
+import { checkDataRoot } from './json-store.js';
 import { restoreUserSettings } from './user-content-seed.js';
 
 /**
@@ -63,7 +66,7 @@ export function createEnsureUserSettingsFile({ seed = restoreUserSettings } = {}
             const root = directories?.root;
             // The official reset recreates the (empty) user root; a missing root means the
             // account is being deleted, which must not be undone here.
-            if (root && !fs.existsSync(path.join(root, SETTINGS_FILE)) && fs.existsSync(root)) {
+            if (root && !fs.existsSync(path.join(root, SETTINGS_FILE)) && fs.existsSync(root) && checkDataRoot().ok) {
                 await restore(directories, req.user?.profile?.handle ?? path.basename(root));
             }
         } catch (error) {

@@ -22,6 +22,7 @@ import {
     resolveQroleLifecycleConfig,
     toTimestamp,
 } from '../../services/qrole-lifecycle.js';
+import { respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
@@ -71,6 +72,7 @@ router.get('/status', async (req, res) => {
             exportAvailable: isFullBackupAllowed(),
         });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole export status error:', error);
         return res.status(500).json({ error: '获取账号信息失败，请稍后重试' });
     }
@@ -108,6 +110,7 @@ router.get('/archive', async (req, res) => {
             throw error;
         }
     } catch (error) {
+        if (!res.headersSent && respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole export archive error:', error);
         if (!res.headersSent) return res.status(500).json({ error: '导出失败，请稍后重试' });
         res.end();

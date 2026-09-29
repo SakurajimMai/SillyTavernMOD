@@ -1,28 +1,39 @@
 /**
  * SillyTavernchat Module - user privacy vault routes.
+ * A vault record that cannot be read answers 503 STORE_UNAVAILABLE (never "not enabled"); a corrupt
+ * one 500 VAULT_RECORD_CORRUPT (see services/privacy-vault.js).
  */
 import express from 'express';
 import { SecretManager } from '../../../endpoints/secrets.js';
 import {
     VaultLockedError,
+    VaultRecordCorruptError,
     VaultRequiredError,
     getVaultStatus,
     lockVault,
     unlockVault,
 } from '../../services/privacy-vault.js';
+import { respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
 /**
- * Helper to handle vault errors gracefully and send correct HTTP status codes.
- * Same as the one in secrets.js
+ * Answer a vault error with the matching HTTP status (VAULT_LOCKED / VAULT_REQUIRED like secrets.js,
+ * STORE_UNAVAILABLE 503, VAULT_RECORD_CORRUPT 500).
+ * @param {import('express').Request} request
+ * @param {import('express').Response} response
+ * @param {any} error
  */
-function sendVaultError(response, error) {
+export function sendVaultError(request, response, error) {
     if (error instanceof VaultLockedError) {
         return response.status(423).send({ error: true, code: 'VAULT_LOCKED', message: error.message });
     }
     if (error instanceof VaultRequiredError) {
         return response.status(428).send({ error: true, code: 'VAULT_REQUIRED', message: error.message });
+    }
+    if (respondStoreError(request, response, error)) return response;
+    if (error instanceof VaultRecordCorruptError) {
+        return response.status(500).send({ error: true, code: error.code, message: error.message });
     }
     return response.status(500).send({
         error: true,
@@ -40,7 +51,7 @@ router.post('/status', (request, response) => {
         return response.json(status);
     } catch (error) {
         console.error('[STC-MOD] Vault /status error:', error);
-        return sendVaultError(response, error);
+        return sendVaultError(request, response, error);
     }
 });
 
@@ -64,7 +75,7 @@ router.post('/enable', async (request, response) => {
         return response.json({ success: true, status, encryptedCount });
     } catch (error) {
         console.error('[STC-MOD] Vault /enable error:', error);
-        return sendVaultError(response, error);
+        return sendVaultError(request, response, error);
     }
 });
 
@@ -92,7 +103,7 @@ router.post('/unlock', (request, response) => {
         }
     } catch (error) {
         console.error('[STC-MOD] Vault /unlock error:', error);
-        return sendVaultError(response, error);
+        return sendVaultError(request, response, error);
     }
 });
 
@@ -107,7 +118,7 @@ router.post('/lock', (request, response) => {
         return response.json({ success: true, status });
     } catch (error) {
         console.error('[STC-MOD] Vault /lock error:', error);
-        return sendVaultError(response, error);
+        return sendVaultError(request, response, error);
     }
 });
 
@@ -145,6 +156,6 @@ router.post('/reset', (request, response) => {
         return response.json({ success: true, existed, removedKeys, status });
     } catch (error) {
         console.error('[STC-MOD] Vault /reset error:', error);
-        return sendVaultError(response, error);
+        return sendVaultError(request, response, error);
     }
 });

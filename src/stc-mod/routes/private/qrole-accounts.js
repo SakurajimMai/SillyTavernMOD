@@ -15,6 +15,7 @@ import {
     previewQroleCleanup,
     runQroleCleanup,
 } from '../../services/qrole-cleanup.js';
+import { respondStoreError } from '../../services/json-store.js';
 
 export const router = express.Router();
 
@@ -38,6 +39,7 @@ router.get('/', async (req, res) => {
     try {
         return res.json(await listQroleAccounts());
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole account list error:', error);
         return res.status(500).json({ error: '获取 QRole 账号列表失败' });
     }
@@ -55,6 +57,7 @@ router.post('/verify', async (req, res) => {
         if (!account) return res.status(404).json({ error: NOT_FOUND_MESSAGE });
         return res.json({ result: verification.result, reason: verification.reason, account });
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole account verify error:', error);
         return res.status(500).json({ error: '复核失败，请稍后重试' });
     }
@@ -65,6 +68,7 @@ router.post('/cleanup/preview', async (req, res) => {
     try {
         return res.json(await previewQroleCleanup());
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole cleanup preview error:', error);
         return res.status(500).json({ error: '预览失败，请稍后重试' });
     }
@@ -75,6 +79,7 @@ router.get('/cleanup/status', (req, res) => {
     try {
         return res.json(getQroleCleanupStatus());
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole cleanup status error:', error);
         return res.status(500).json({ error: '获取清理状态失败' });
     }
@@ -96,6 +101,7 @@ router.post('/cleanup/run', async (req, res) => {
         }
         return res.json(run.result);
     } catch (error) {
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole cleanup run error:', error);
         return res.status(500).json({ error: '清理失败，请稍后重试' });
     }

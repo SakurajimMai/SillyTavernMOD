@@ -5,13 +5,19 @@
  * Notes:
  * - Disk usage reflects the filesystem that holds the data root, not the whole
  *   machine. The admin UI should label it accordingly.
- * - History is persisted atomically (temp file + rename) and capped, so a crash
+ * - History is persisted atomically (temp file + rename, `.bak` copy) and capped, so a crash
  *   or concurrent write cannot corrupt or lose the whole history file.
+ * - The history is read from disk once and then kept in memory. While the file cannot be read
+ *   (StoreUnavailableError: remote storage / mount failure) new snapshots are only kept in memory
+ *   and the file is never written, so a failed read can never replace the stored history with a
+ *   shorter one; they are merged in once the file is readable again. An unparseable file (no
+ *   usable `.bak`) is kept as `.corrupt-<ts>` and the history starts empty.
  */
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getStcDataDir, getDataRoot } from '../config.js';
+import { readJsonFile, writeJsonFileAtomic } from './json-store.js';
 
 const HISTORY_FILE = 'system-monitor-history.json';
 const MAX_HISTORY_POINTS = 288; // 24h at 5min intervals
@@ -85,7 +91,8 @@ function getDiskUsage() {
             scope: 'dataRoot',
         };
     } catch {
-        return { total: 0, used: 0, free: 0, percent: 0, scope: 'dataRoot' };
+        // `unknown`: the data root could not be measured (the zeros are not a reading)
+        return { total: 0, used: 0, free: 0, percent: 0, scope: 'dataRoot', unknown: true };
     }
 }
 
@@ -108,49 +115,71 @@ export function getHistoryPath() {
     return path.join(getStcDataDir(), HISTORY_FILE);
 }
 
+/** History loaded from disk (source of truth once set); null until the file was read. */
+let historyCache = null;
+/** Snapshots taken while the history file could not be read (merged on the next successful load). */
+let pendingSnapshots = [];
+
+/**
+ * Keep at most MAX_HISTORY_POINTS points (oldest dropped).
+ * @param {any[]} history
+ */
+function capHistory(history) {
+    while (history.length > MAX_HISTORY_POINTS) history.shift();
+}
+
+/**
+ * Load the history file into memory once (snapshots taken meanwhile are merged in).
+ * @returns {any[]} The in-memory history
+ * @throws {import('./json-store.js').StoreUnavailableError} The file cannot be read right now
+ */
+function ensureHistoryLoaded() {
+    if (historyCache) return historyCache;
+    const result = readJsonFile(getHistoryPath(), { validate: Array.isArray, backup: true, label: 'Monitor history' });
+    const stored = result.status === 'ok' || result.status === 'recovered' ? result.data : [];
+    const lastStored = stored.length ? Number(stored[stored.length - 1]?.timestamp) || 0 : 0;
+    historyCache = stored.concat(pendingSnapshots.filter(point => point.timestamp > lastStored));
+    pendingSnapshots = [];
+    capHistory(historyCache);
+    return historyCache;
+}
+
+/**
+ * Stored history (read once, then served from memory).
+ * @returns {any[]}
+ * @throws {import('./json-store.js').StoreUnavailableError} The history has never been readable yet
+ */
 export function loadHistory() {
-    const filePath = getHistoryPath();
-    if (!fs.existsSync(filePath)) return [];
-    try {
-        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        return Array.isArray(parsed) ? parsed : [];
-    } catch {
-        // Corrupted history is non-critical; recover what we can from a backup.
-        try {
-            const backup = filePath + '.bak';
-            if (fs.existsSync(backup)) {
-                const parsed = JSON.parse(fs.readFileSync(backup, 'utf8'));
-                return Array.isArray(parsed) ? parsed : [];
-            }
-        } catch { /* ignore */ }
-        return [];
-    }
+    return ensureHistoryLoaded().slice();
 }
 
 /**
  * Atomically persist history (temp file + rename) with a single backup copy.
+ * A failed write keeps the history in memory (retried with the next snapshot).
  * @param {any[]} history
  */
 function saveHistory(history) {
-    const filePath = getHistoryPath();
-    const tmpPath = `${filePath}.${process.pid}.tmp`;
     try {
-        fs.writeFileSync(tmpPath, JSON.stringify(history), 'utf8');
-        if (fs.existsSync(filePath)) {
-            try { fs.copyFileSync(filePath, filePath + '.bak'); } catch { /* best-effort */ }
-        }
-        fs.renameSync(tmpPath, filePath);
+        writeJsonFileAtomic(getHistoryPath(), history, { backup: true, space: 0 });
     } catch (e) {
-        console.error('[STC-MOD] Failed to save monitor history:', e.message);
-        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+        console.error('[STC-MOD] Failed to save monitor history:', e?.detail || e?.message);
     }
 }
 
 export function recordSnapshot() {
     const snapshot = getSystemLoad();
-    const history = loadHistory();
+    let history;
+    try {
+        history = ensureHistoryLoaded();
+    } catch (e) {
+        // Never write while the stored history is unknown: keep the point in memory
+        pendingSnapshots.push(snapshot);
+        capHistory(pendingSnapshots);
+        console.error('[STC-MOD] Monitor history unavailable, snapshot kept in memory:', e?.detail || e?.message);
+        return snapshot;
+    }
     history.push(snapshot);
-    while (history.length > MAX_HISTORY_POINTS) history.shift();
+    capHistory(history);
     saveHistory(history);
     return snapshot;
 }

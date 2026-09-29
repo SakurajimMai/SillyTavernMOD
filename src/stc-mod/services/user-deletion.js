@@ -2,11 +2,19 @@
  * SillyTavernchat Module - Account deletion
  * Full deletion of an account (official registry record + data directory + STC metadata), shared by
  * the admin user management routes and the QRole expired-account cleanup job.
+ * Nothing is removed while the data root mount is lost or the user metadata cannot be read
+ * (`skipped: 'store_unavailable'`, see services/json-store.js); the usage cache of the account is
+ * dropped after every deletion attempt.
  */
 import { promises as fsPromises } from 'node:fs';
 import storage from 'node-persist';
 import { toKey, getUserDirectories } from '../../users.js';
-import { deleteUserMeta } from '../user-metadata.js';
+import { deleteUserMeta, ensureUserMetadataLoaded } from '../user-metadata.js';
+import { STORE_UNAVAILABLE_MESSAGE, assertDataRootAvailable, isStoreUnavailableError } from './json-store.js';
+import { invalidateUserUsage } from './storage-quota.js';
+
+/** `skipped` reason of deleteUserWithLock when a data store is unavailable (nothing was removed). */
+export const DELETION_STORE_UNAVAILABLE = 'store_unavailable';
 
 // Fine-grained deletion locks: Map<handle, Promise>
 // Each user's deletion operation is tracked independently, so concurrent deletions
@@ -67,7 +75,7 @@ export async function waitForUserDeletion(handle) {
  *   lock is held, right before anything is removed; a returned reason cancels the deletion
  *   (automatic jobs use it to re-check that the account is still eligible)
  * @returns {Promise<{success: boolean, error: string, skipped?: string}>} `skipped`: the precheck
- *   cancelled the deletion (nothing was removed)
+ *   cancelled the deletion, or 'store_unavailable' (data root / metadata unavailable); nothing was removed
  */
 export async function deleteUserWithLock(handle, { precheck } = {}) {
     if (!handle || handle === 'default-user') {
@@ -76,6 +84,15 @@ export async function deleteUserWithLock(handle, { precheck } = {}) {
 
     const release = await acquireUserDeletionLock(handle);
     try {
+        try {
+            // A lost mount makes every path resolve to the empty directory underneath, and the
+            // metadata must be loaded before its entry can be removed: delete nothing in either case
+            assertDataRootAvailable();
+            ensureUserMetadataLoaded();
+        } catch (error) {
+            if (!isStoreUnavailableError(error)) throw error;
+            return { success: false, error: STORE_UNAVAILABLE_MESSAGE, skipped: DELETION_STORE_UNAVAILABLE };
+        }
         if (precheck) {
             const veto = await precheck();
             if (veto) return { success: false, error: '', skipped: String(veto) };
@@ -95,6 +112,7 @@ export async function deleteUserWithLock(handle, { precheck } = {}) {
     } catch (error) {
         return { success: false, error: error.message || 'Unknown error' };
     } finally {
+        invalidateUserUsage(handle);
         release();
     }
 }

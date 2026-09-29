@@ -16,9 +16,15 @@
  * Right after QRole itself reported the lapse (5 minutes), replayed old session cookies are refused
  * without asking QRole again.
  * Must be registered AFTER setUserDataMiddleware (needs req.user).
+ *
+ * While the user metadata cannot be read (StoreUnavailableError) the guard fails closed: requests of
+ * logged-in non-admin users answer 503 STORE_UNAVAILABLE (nobody can tell whether the account is a
+ * QRole account). Exceptions: admins, and every request while `oauth.qrole.requireMembership` is
+ * off (the guard needs no metadata then).
  */
 import { getUserMeta } from '../user-metadata.js';
 import { liveMetaForRecord } from './account-security.js';
+import { respondStoreError } from './json-store.js';
 import {
     decideQroleSession,
     getQroleConfig,
@@ -44,12 +50,12 @@ export async function qroleSessionGuard(req, res, next) {
         const profile = req.user?.profile;
         if (!profile || profile.admin) return next();
 
+        const cfg = getQroleConfig();
+        if (cfg.requireMembership === false) return next();
+
         const handle = profile.handle;
         const meta = liveMetaForRecord(getUserMeta(handle), profile);
         if (meta?.oauthProvider !== 'qrole') return next();
-
-        const cfg = getQroleConfig();
-        if (cfg.requireMembership === false) return next();
 
         const isApi = String(req.path).toLowerCase().startsWith('/api/');
         const now = Date.now();
@@ -78,6 +84,8 @@ export async function qroleSessionGuard(req, res, next) {
         }
         return next();
     } catch (error) {
+        // Metadata unavailable: fail closed (503) instead of letting a possibly lapsed session through
+        if (respondStoreError(req, res, error)) return;
         console.error('[STC-MOD] QRole session guard error:', error);
         return next();
     }

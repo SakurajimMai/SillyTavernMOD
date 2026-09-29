@@ -20,10 +20,12 @@ LLM Frontend for Power Users
   - [7. 常见问题](#7-常见问题)
   - [8. 从旧版本升级（必读）](#8-从旧版本升级必读)
 - [用户数据存储到 S3（R2 / B2，JuiceFS）](#用户数据存储到-s3r2--b2juicefs)
+  - [7. 存储故障保护](#7-存储故障保护)
 - [QRole 会员登录与注册开关](#qrole-会员登录与注册开关)
 - [页面背景与站点信息](#页面背景与站点信息)
 - [反向代理部署（nginx / OpenResty / Cloudflare）](#反向代理部署nginx--openresty--cloudflare)
 - [STC-MOD 功能概览](#stc-mod-功能概览)
+  - [存储配额规则](#存储配额规则)
 - [升级与二次开发注意事项](#升级与二次开发注意事项)
 - [修改记录 (MODIFICATIONS)](#修改记录-modifications)
 - [上游资源与协议](#上游资源与协议)
@@ -279,7 +281,7 @@ Go to: http://127.0.0.1:8000/ to open SillyTavern
 | 开放注册 / 邀请码 | STC 管理面板「邀请码」→「注册设置」；邀请码功能需 `config.yaml` 中 `enableInvitationCodes: true` | 默认开放注册、不要求邀请码（见 [关闭注册](#关闭注册)） |
 | QRole 会员登录 | STC 管理面板「OAuth 配置」→ QRole | 需要 QRole 运营方开通 OAuth 应用（见 [QRole 会员登录与注册开关](#qrole-会员登录与注册开关)） |
 | 邮件 | STC 管理面板「邮件配置」；`config.yaml` → `email.siteUrl`（邮件中的站点链接） | 保存后可发送测试邮件验证 |
-| 存储配额 | STC 管理面板「用户空间」（`userStorage`） | 默认启用，每个用户（包括管理员）上限 50 MiB，超出后写入返回 HTTP 507；新账号自带约 15 MiB 默认内容（默认背景图、示例角色等），实际可用约 35 MiB（设置 `newUserContent: minimal` 后新注册账号只带约 80 KB，见 [减少对象存储写入](#6-减少对象存储写入)）；保存后建议重启 |
+| 存储配额 | STC 管理面板「用户空间」（`userStorage`） | 默认启用，每个用户（包括管理员）上限 50 MiB，超出后新增内容的写入返回 HTTP 507（删除、改名和不增大文件的保存始终允许，见 [存储配额规则](#存储配额规则)）；新账号自带约 15 MiB 默认内容（默认背景图、示例角色等），实际可用约 35 MiB（设置 `newUserContent: minimal` 后新注册账号只带约 80 KB，见 [减少对象存储写入](#6-减少对象存储写入)）；保存后建议重启 |
 | API 密钥保险箱 | `config.yaml` → `privacy.secretsVault.requireForApiKeys`（默认 `true`） | 用户须先在个人面板「API 密钥保险箱」中启用并解锁，才能保存 API 密钥；解锁状态只保存在内存中，服务重启或超过 `privacy.secretsVault.unlockTtlMinutes`（默认 1440 分钟，即 24 小时）后需重新解锁（见 [API 密钥保险箱](#api-密钥保险箱与-requireforapikeys)） |
 | 内网访问防护（可选） | `config.yaml` → `privateAddressWhitelist.enabled: true` | 官方建议在对不受信任的用户开放时启用，阻止服务器代为访问内网地址（本机 `127.0.0.1` 默认放行）；启用后用户无法连接内网中的模型服务 |
 | 数据存到 S3 | `docker/docker-compose.s3.yml` | 见 [用户数据存储到 S3](#用户数据存储到-s3r2--b2juicefs)；建议同时设置 `skipContentCheck: true` 与 `newUserContent: minimal`（见 [减少对象存储写入](#6-减少对象存储写入)） |
@@ -468,6 +470,12 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
 
 - 在反向代理后面，默认所有访客共用反代的 IP 计数，见 [访客真实 IP 与登录限流](#访客真实-ip-与登录限流)。等待 1 分钟后重试，或按该节开启 `rateLimiting.preferRealIpHeader`。
 
+**接口返回 503「数据存储暂时不可用，请稍后重试」（`STORE_UNAVAILABLE`）**
+
+- STC 的数据文件暂时读不出来（JuiceFS 挂载掉线、远程存储出错、文件权限等），STC-MOD 拒绝把它当成空数据，详见 [存储故障保护](#7-存储故障保护)。日志中有 `[STC-MOD] ... answered 503, ...` 或 `[STC-MOD] User metadata unavailable (...)`，括号内是具体原因。
+- S3 部署：确认 `juicefs` 容器正常运行，然后执行 `docker compose -f docker-compose.s3.yml restart juicefs sillytavern`；开启看门狗（默认）时 SillyTavern 会在挂载消失后自动退出并重启。
+- 本地部署：检查数据目录的磁盘与权限（`data/stc-mod/` 需要可读写）。存储恢复后无需重启，最多约 5 秒后自动恢复。
+
 **端口被占用**
 
 - 方式 C 的日志出现 `Address ... is already in use. Another SillyTavern instance may already be running. Stop the other process or change "port" in config.yaml.`：可能已有另一个 SillyTavern 在运行（例如用 `npm run start` 启动后只结束了 npm 进程，node 子进程仍在监听）。用 `ss -ltnp | grep :8000` 找到占用端口的进程并结束，或修改 `config.yaml` 中的 `port`（也可以 `./start.sh --port 8001`）。
@@ -487,6 +495,8 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
 6. **`config.yaml` 改为原子写入**：STC-MOD 保存配置时先写临时文件再替换（保留 Docker 中的符号链接）；文件有语法错误时拒绝写入，运行中的服务继续使用最后一次正确的设置。拒绝写入时，「注册设置」「OAuth 配置」会提示保存失败；「邮件配置」「用户空间」「定时任务」和购买链接仍会显示保存成功，但实际没有写入。此时不要重启：带语法错误的 `config.yaml` 会让服务启动失败（`FATAL: Failed to read config.yaml...`，Docker 容器会不断重启），先修正语法再重启。
 7. **反代信任改为手动配置**：旧版的自动探测已移除，经反向代理用 HTTPS 部署时需在 `config.yaml` 中设置 `deployment.trustProxy`（见 [反向代理部署](#反向代理部署nginx--openresty--cloudflare)）。
 8. **Docker 用户要手动更新 STC 管理面板**：容器不会覆盖挂载目录中已有的 `stc-admin-panel`，更新镜像后请先删除宿主机上的 `extensions/stc-admin-panel` 再启动容器（见 [更新](#更新)）。
+9. **存储读取错误改为返回 503**：以前 STC 数据文件读取出错时会按空数据处理（例如邀请码列表为空、保险箱显示未启用、用户元数据从空开始并在之后覆盖原文件）。现在返回 503 `STORE_UNAVAILABLE`，数据文件不会被覆盖；数据根目录是单独挂载时，挂载消失、启动时不可访问或无响应时进程会自动退出重启（`stcDataRootWatchdog: false` 可关闭，见 [存储故障保护](#7-存储故障保护)）。
+10. **存储配额规则调整**：超额后删除、改名和不增大文件的保存不再被拦截；占用改为后台异步统计（结果最多延迟约 30 秒，统计失败时不拦截写入），管理面板可能暂时显示「统计中…」（见 [存储配额规则](#存储配额规则)）。
 
 ---
 
@@ -588,7 +598,7 @@ JuiceFS 每次改写文件都会上传新的数据块，被替换的旧版本还
 - 只有活跃时间变化时，该文件 **最多每 60 秒写入一次**（期间所有心跳合并为一次写入），并且 **不刷新** `user-metadata.json.bak`。
 - 其他真实变更（注册、改密、续期、存储配额、QRole 会员状态等）仍在 5 秒内写入；登录、删除账号、修改到期时间等本来就立即写入的操作不变。活跃时间待写入期间发生真实变更时，两者在 5 秒内一起写入。
 - 正常停止（`docker stop`、Ctrl+C、SIGTERM）时会写入所有未保存的改动；进程被强制杀死（`kill -9`、内存不足）时最多丢失约 1 分钟的活跃时间，其他数据最多丢失 5 秒内的改动（与以前相同）。
-- `user-metadata.json.bak` 只在写入真实变更时更新，保存的是 **最近一次真实变更之前** 的状态（其中的 `lastActiveAt` 可能较旧）；主文件损坏时启动会自动从它恢复。主文件和 `.bak` 都无法读取时，元数据从空开始，原文件改名保留为 `user-metadata.json.corrupt-<时间戳>`（以及 `user-metadata.json.bak.corrupt-<时间戳>`），可手工修复后改回原名再重启。
+- `user-metadata.json.bak` 只在写入真实变更时更新，保存的是 **最近一次真实变更之前** 的状态（其中的 `lastActiveAt` 可能较旧）；主文件损坏时启动会自动从它恢复。主文件和 `.bak` 都无法解析时，元数据从空开始，先把原文件复制保留为 `user-metadata.json.corrupt-<时间戳>`（以及 `user-metadata.json.bak.corrupt-<时间戳>`），可手工修复后改回原名再重启。**读取出错**（挂载掉线、EIO 等）不属于这种情况：此时不会从空开始，也不会写入，见 [存储故障保护](#7-存储故障保护)。
 
 **`skipContentCheck: true`（推荐）**：在 `config.yaml`（Docker：`docker/config/config.yaml`）中设置，重启生效。
 
@@ -608,13 +618,26 @@ JuiceFS 每次改写文件都会上传新的数据块，被替换的旧版本还
 - 只补这两个文件，**不会** 重新复制约 190 个默认文件（那样会在请求中同步上传约 15 MiB、阻塞整个服务器）；已有文件从不覆盖。`newUserContent: minimal` 时，若 `content.log` 也不存在（官方重置账号），会像新注册账号一样写入 `content.log`。
 - 文件存在或未登录时不做任何事；补齐失败只记录日志，不影响请求。
 
+### 7. 存储故障保护
+
+JuiceFS 容器重启时，SillyTavern 容器内的挂载可能消失，同一路径随之指向下面 **空的** 本地目录（到处都是「文件不存在」）；JuiceFS 进程异常时，读取会失败（`ENOTCONN` / `EIO`）。STC-MOD 不会把这些情况当成「没有数据」（全部实现位于 `src/stc-mod/`，默认开启，无需配置）：
+
+- **读取出错 ≠ 空数据**：STC 的数据文件（`data/stc-mod/` 下的用户元数据、邀请码、存储激活码、公告、默认模板、API 密钥保险箱记录、QRole 清理状态、系统监控历史）只有在「文件不存在」时才视为空；其他读取错误一律返回 **HTTP 503** `{"error":"数据存储暂时不可用，请稍后重试","code":"STORE_UNAVAILABLE"}`（页面返回一行 503 文字），不会返回空列表，也不会用空数据覆盖原文件。文件内容损坏时先用 `.bak` 恢复；没有可用备份时从空开始，并把损坏的文件复制保留为 `<文件名>.corrupt-<时间戳>`。主文件不存在但 `.bak` 可用时同样使用 `.bak`（日志 `... is missing but ....bak is valid`），下次写入重建主文件，`.bak` 不会被几乎为空的新数据覆盖；`.bak` 也损坏时先复制保留再从空开始。
+- **用户元数据**（OAuth 绑定、QRole 令牌、邮箱、到期时间、存储上限等）：启动后第一次读取失败时不会创建空数据，需要它的请求返回 503，之后最多每 5 秒重试一次，恢复后自动继续；读取成功之前从不写入。此时密码登录（无法确认是否为 QRole 会员账号）、QRole 账号的会话校验、邀请码到期检查都返回 503（不会放行，也不会把用户登出）；第三方登录不会因为「找不到绑定」而新建第二个账号；删除账号、清理不活跃用户、QRole 过期账号清理都会停止，不删除任何账号。
+- **API 密钥保险箱**：记录读取失败时返回 503，绝不会当成「未启用保险箱」而把 API 密钥明文保存；启用保险箱不会覆盖已有但读不出的记录。
+- **挂载检测**：启动时记录数据根目录所在的设备；数据根目录位于单独挂载的文件系统上（例如 JuiceFS 的 `/mnt/jfs/fs/data`）时，每次读写 STC 数据前后都会确认挂载仍在，挂载消失后不会在下面的本地目录中创建任何文件。启动时数据根目录就无法访问（例如 JuiceFS 已失效，`ENOTCONN`）时，STC 数据一直返回 503，开启看门狗时进程立即退出由 Docker 重启。可选 `stcDataRootMustBeMount: true`（`config.yaml` 顶层，默认 `false`）：数据根目录不是单独挂载时同样视为不可用（防止挂载尚未就绪就以空目录启动）。
+- **注意**：设备检测只能发现「挂载不在了」。挂载短暂消失后又以相同设备号恢复（Linux 会复用设备号）时，单靠设备号看不出来，所以在看门狗开启时，**任何一次 STC 读写发现挂载不可用都会被记住**：之后不再信任该挂载、不写入任何数据，并在下一次检查（15 秒内）退出重启。第三方登录发现「账号记录不存在」时，会在确认挂载可用、账号库目录存在并重新读取后才认定账号已删除并解除绑定；新建账号前也会在写入前重新确认用户名确实空闲，挂载故障期间不会解除绑定、不会覆盖已有账号。
+- **看门狗 `stcDataRootWatchdog`**（`config.yaml` 顶层，默认 `true`，只在数据根目录是单独挂载时生效）：在独立的工作线程中每 15 秒检查一次挂载，发现挂载消失或设备变化时记录错误日志（`[STC-MOD] Data root lost: ...`）并退出进程（退出码 1）；检查卡住 60 秒（挂载无响应）时记录日志后直接用 SIGKILL 结束进程（此时正常退出会一直卡住），主线程被卡住的同步读写阻塞时同样有效。Docker 按 `restart: unless-stopped` 重启容器，启动脚本会等待 JuiceFS 重新挂载后才启动 SillyTavern。检查卡住超过 5 秒时，STC 读写直接返回 503，不再去访问卡住的挂载。设为 `false` 时只拒绝读写 STC 数据（返回 503），需要手动重启。
+- 官方数据（账号库 `_storage`、各用户目录）不在此范围内：挂载消失后已登录的请求通常直接返回官方的 403，看门狗会在十几秒内重启服务。
+- 兑换存储激活码或邀请码时，若激活码已标记为已使用、但随后保存新的上限 / 到期时间失败（两次写入之间挂载恰好消失），新值会留在内存中稍后重试，同时记录一条带用户名和激活码的错误日志（`... could not be saved yet ...`），接口结果带 `persisted: false`；若进程在重试成功前退出，请按日志手动补上。
+
 ### 注意事项
 
 - 元数据库中保存着 S3 访问密钥（JuiceFS 社区版明文保存），请限制数据库访问来源；`docker/s3.env` 保持仅 root 可读。二者均已加入 `.gitignore` / `.dockerignore`。
 - 在 R2 / B2 控制台里看到的是 `<JFS_NAME>/chunks/...` 数据块，不是一个个角色卡文件；查看或导出文件请通过 `docker/juicefs/mnt/fs/data` 或 SillyTavern 本身。
 - 不要在存储桶上开启会自动删除/转存对象的生命周期规则；删除或被覆盖的文件会先进入 JuiceFS 回收站（默认 7 天，`JFS_TRASH_DAYS`；juicefs 容器每次启动都会按 `s3.env` 同步，修改后执行 `docker compose up -d --force-recreate juicefs sillytavern` 生效；酒馆每次保存都会产生旧版本，访问量大时可设为 1–2 天）。
 - 启动顺序已做保护：SillyTavern 会等待 JuiceFS 挂载就绪后才启动（即使服务器重启后 Docker 以任意顺序拉起容器），不会把数据误写到本地目录。
-- JuiceFS 容器重启后需同时重启 SillyTavern：`docker compose -f docker-compose.s3.yml restart juicefs sillytavern`。
+- JuiceFS 容器重启后需同时重启 SillyTavern：`docker compose -f docker-compose.s3.yml restart juicefs sillytavern`。未手动重启时，SillyTavern 的挂载看门狗会在约 15 秒内发现挂载消失并退出，由 Docker 自动重启（见 [存储故障保护](#7-存储故障保护)）；在此之前 STC 功能返回 503。
 - 如需把数据加密后再上传（桶内数据对服务商不可读），可在首次启动前参考 JuiceFS 文档启用 `--encrypt-rsa-key`；私钥丢失将无法恢复数据。
 - S3 部署中 `recover.js` 只读取 `config.yaml` 里的 `dataRoot`，找不到 JuiceFS 上的账号数据；忘记密码请用登录页的「忘记密码？」（见 [忘记密码](#忘记密码)）。
 
@@ -1093,6 +1116,18 @@ STC-MOD 的主要能力包括（非完整列表）：
 
 所有后端路由均通过 `src/stc-mod/index.js` 注册，前端管理与入口则通过
 `public/scripts/extensions/third-party/stc-admin-panel/` 扩展注入。
+
+### 存储配额规则
+
+启用「用户空间」（`userStorage.enabled`）后，每个用户目录的占用与上限比较，超出后 **新增内容** 的写入返回 HTTP 507（提示删除聊天或消息、角色卡、背景图片或聊天备份来释放空间，或联系管理员扩容）：
+
+- **删除和改名始终允许**，不受空间限制：所有 `DELETE` 请求以及最后一段为 `delete` / `remove` / `rename` / `clear` / `purge` 的接口（删除聊天、角色卡、背景、图片、文件、表情包、聊天备份 `/api/backups/chat/delete`，改名背景 / 聊天 / 角色卡等）。列出背景、图片等只读接口也不受限制。
+- **超额时仍可保存变小的文件**：聊天保存与群聊保存（`/api/chats/save`、`/api/chats/group/save`）在新内容 **小于** 已有文件时允许（例如删除消息）；内容与已有文件完全相同的保存（例如切换角色时酒馆重新保存未改动的聊天）直接返回成功、不重复写入。世界书编辑（`/api/worldinfo/edit`）在新内容不大于已有文件时允许（例如删除条目）。新建文件、内容变大，或大小不变但内容改变的聊天保存仍返回 507。
+- **聊天备份**：官方每次保存聊天（包括超额时允许的变小保存）都可能写入一份 **完整** 的聊天备份 `backups/chat_<角色>_<时间>.jsonl`（同一聊天最多每 10 秒一份，`backups.chat.throttleInterval`）。每个角色 / 群聊最多保留 `backups.common.numberOfBackups` 份（默认 50），`backups.chat.maxTotalBackups` 默认 `-1` 即 **没有总数上限**，因此备份可能占用聊天大小的数十倍。启用空间配额的部署建议在 `config.yaml` 中设置 `backups.chat.maxTotalBackups`（例如 `20`）或减小 `backups.common.numberOfBackups`。备份计入用户占用，可以在界面中删除（官方 `/api/backups/chat/delete`，不受空间限制）。
+- **超额时拦截的写入**：上传文件 / 图片 / 表情包 / 背景 / 用户头像，导入聊天与群聊，新建、导入与复制角色卡，更换角色头像，导入世界书（`/api/worldinfo/import`），从网址 / UUID 导入内容（`/api/content/importURL`、`importUUID`），下载资源（`/api/assets/download`），新建群组，安装扩展（`/api/extensions/install`），以及使文件变大或新建文件的聊天保存、群聊保存和世界书编辑。编辑角色卡（`/api/characters/edit`、`edit-attribute`、`merge-attributes`）在超额时只允许请求不超过 1 MiB 的修改（角色卡较大、附带新头像或未知大小时返回 507）。其他接口（设置、预设、主题、快速回复、群组编辑、向量库等）不受配额限制。
+- **占用在后台异步统计**，保存前不再同步扫描用户目录：统计结果缓存 10 分钟；成功的写入先预估计入（聊天与世界书按文件增大的字节数，其他按请求大小），约 30 秒内重新统计；删除或改名后约 1.5 秒内重新统计，释放的空间很快生效。仅因预估而超额时会先重新统计再决定是否拒绝。统计同时最多进行 3 个文件操作（Node 默认 4 个 I/O 线程中留出 1 个给其他请求；设置环境变量 `UV_THREADPOOL_SIZE` 可加快统计），不会一次性为每个文件排队。
+- **统计失败（例如存储读取错误）时占用视为「未知」，不会阻止写入**（记录一条日志），不会被当成 0，也不会把用户锁在外面。统计超过 2 分钟仍未完成时不再等待它（尚无结果的用户显示「未知」，已有旧结果的继续使用旧结果），但同一用户不会同时开始第二次统计，完成后的结果照常缓存。个人面板显示「未知」；管理面板的用户列表与存储分析最多等待约 5 秒，尚未统计完的用户显示「统计中…」，稍后刷新即可看到结果。
+- 管理员修改某个用户的上限、重置或删除用户后，该用户的统计缓存会立即失效。
 
 ---
 

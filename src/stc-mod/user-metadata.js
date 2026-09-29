@@ -4,8 +4,15 @@
  * Does NOT modify the official users.js user model.
  *
  * Persistence design:
- * - A single in-memory cache (`metadataCache`) is the source of truth at runtime; readers see
- *   every update immediately, disk writes happen later.
+ * - A single in-memory cache (`metadataCache`) is the source of truth at runtime once it was loaded
+ *   successfully; readers see every update immediately, disk writes happen later.
+ * - Loading classifies read errors (services/json-store.js): a missing file starts an empty store
+ *   (unless `user-metadata.json.bak` is valid: then the backup is used and the file recreated);
+ *   an unparseable file is recovered from `user-metadata.json.bak`, or (no usable `.bak`) kept as
+ *   `<name>.corrupt-<timestamp>` while the store starts empty. Any other error (EIO, ENOTCONN,
+ *   EACCES, a lost data root mount, ...) is StoreUnavailableError: NO empty cache is created, every
+ *   access throws (HTTP 503) and the load is retried on a later access (at most once per
+ *   LOAD_RETRY_MS). Nothing is ever written before a successful load.
  * - Writes are coalesced (services/flush-scheduler.js) because the whole JSON file is rewritten on
  *   every flush and the data root may be remote object storage (JuiceFS on B2: each rewrite uploads
  *   new chunks and keeps the replaced version in the trash):
@@ -14,18 +21,27 @@
  *   - real changes are flushed within FLUSH_DEBOUNCE_MS (5 s), also when activity was already
  *     pending (the earlier deadline wins);
  *   - `immediate: true`, flushMetadata() and the exit/SIGINT/SIGTERM hooks flush everything now.
+ *   A failed flush keeps the changes pending and is retried.
  * - Disk writes are atomic (write to a temp file, then rename) so a crash or a
  *   concurrent write can never leave a half-written / corrupted metadata file.
+ * - When the store was loaded as missing, the first write only creates the file: if a
+ *   user-metadata.json appeared meanwhile (e.g. the mount came back), it is merged into the cache
+ *   instead of being overwritten.
  * - `user-metadata.json.bak` is refreshed (copy of the current file) only by flushes that contain a
  *   real change, so it holds the last state before the most recent real change; its
- *   `lastActiveAt` values may be older. A corrupted main file is recovered from it on load; when
- *   there is no usable `.bak` either, the unreadable file(s) are kept as `<name>.corrupt-<timestamp>`
- *   and the store starts empty.
+ *   `lastActiveAt` values may be older. It is never refreshed from a main file known to be unreadable.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 import { getStcDataDir } from './config.js';
 import { createFlushScheduler } from './services/flush-scheduler.js';
+import {
+    StoreConflictError,
+    StoreUnavailableError,
+    isPlainObject,
+    isStoreUnavailableError,
+    readJsonFile,
+    writeJsonFileAtomic,
+} from './services/json-store.js';
 
 const METADATA_FILE = 'user-metadata.json';
 
@@ -33,88 +49,87 @@ const METADATA_FILE = 'user-metadata.json';
 export const FLUSH_DEBOUNCE_MS = 5000;
 /** Activity-only changes (lastActiveAt) are written at most this often (ms). */
 export const ACTIVITY_FLUSH_MS = 60_000;
+/** After a failed load (store unavailable), the next load attempt happens at most this often (ms). */
+export const LOAD_RETRY_MS = 5000;
 /** Fields whose updates alone are activity-only changes (see setUserMeta). */
 const ACTIVITY_ONLY_KEYS = new Set(['lastActiveAt']);
 
 /** @type {Object<string, UserExtendedData>|null} */
 let metadataCache = null;
 /**
- * Set after the store was recovered from `.bak` because the main file could not be parsed: the next
- * write must not copy the broken main file over the (good) `.bak`.
+ * Last failed load: every access rethrows it until the next attempt is due.
+ * @type {{error: StoreUnavailableError, at: number}|null}
  */
-let skipNextBackup = false;
+let loadFailure = null;
+/**
+ * The store was loaded as missing: the first write must not replace a file that appeared meanwhile.
+ */
+let expectMissingFile = false;
 
 function getMetadataPath() {
     return path.join(getStcDataDir(), METADATA_FILE);
 }
 
 /**
- * Read and parse a metadata file (must hold a JSON object).
- * @param {string} file
+ * Load the metadata file into the cache (or rethrow the last failure while a retry is not due).
  * @returns {Object<string, UserExtendedData>}
+ * @throws {StoreUnavailableError}
  */
-function readMetadataFile(file) {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('not a JSON object');
-    }
-    return parsed;
-}
-
-/**
- * Move an unreadable metadata file aside (`<name>.corrupt-<timestamp>`) before the store is reset,
- * so its raw bytes can still be repaired by hand. Best effort: falls back to a copy.
- * @param {string} file
- */
-function setAsideUnreadable(file) {
-    if (!fs.existsSync(file)) return;
-    const target = `${file}.corrupt-${Date.now()}`;
-    try {
-        fs.renameSync(file, target);
-    } catch {
-        try {
-            fs.copyFileSync(file, target);
-        } catch (e) {
-            console.error(`[STC-MOD] Could not keep a copy of the unreadable ${path.basename(file)}:`, e.message);
-            return;
-        }
-    }
-    console.error(`[STC-MOD] Kept the unreadable ${path.basename(file)} as ${target}`);
-}
-
 function loadMetadata() {
     if (metadataCache) return metadataCache;
-    const filePath = getMetadataPath();
-    if (!fs.existsSync(filePath)) {
-        metadataCache = {};
-        return metadataCache;
+    const now = Date.now();
+    if (loadFailure && now >= loadFailure.at && now - loadFailure.at < LOAD_RETRY_MS) {
+        throw loadFailure.error;
     }
+
+    let result;
     try {
-        metadataCache = readMetadataFile(filePath);
-    } catch (e) {
-        console.error('[STC-MOD] Failed to read user metadata:', e.message);
-        // Try to recover from the last good backup rather than silently dropping all data.
-        const backup = filePath + '.bak';
-        let recovered = null;
-        try {
-            if (fs.existsSync(backup)) recovered = readMetadataFile(backup);
-        } catch (backupError) {
-            console.error('[STC-MOD] User metadata backup is unreadable too:', backupError.message);
+        result = readJsonFile(getMetadataPath(), { validate: isPlainObject, backup: true, label: 'User metadata' });
+    } catch (error) {
+        const failure = isStoreUnavailableError(error)
+            ? /** @type {StoreUnavailableError} */ (error)
+            : new StoreUnavailableError(`user metadata could not be loaded (${error?.message || error})`, { cause: error });
+        console.error(`[STC-MOD] User metadata unavailable (${failure.detail}); requests that need it answer 503, next attempt in ${LOAD_RETRY_MS / 1000} s. Nothing is written until it was read.`);
+        loadFailure = { error: failure, at: now };
+        throw failure;
+    }
+
+    if (loadFailure) console.log('[STC-MOD] User metadata is readable again.');
+    loadFailure = null;
+    // Also when the data comes from `.bak` because the main file is missing
+    expectMissingFile = result.status === 'missing' || result.mainMissing === true;
+    if (result.status === 'ok' || result.status === 'recovered') {
+        metadataCache = result.data;
+    } else {
+        if (result.status === 'corrupt') {
+            console.error('[STC-MOD] User metadata could not be read and has no usable backup: starting with an empty store (the unreadable file was kept).');
         }
-        if (recovered) {
-            metadataCache = recovered;
-            skipNextBackup = true;
-            console.warn('[STC-MOD] Recovered user metadata from backup.');
-        } else {
-            // No usable backup: the store starts empty. Keep the unreadable files (main and .bak)
-            // instead of letting the next writes replace them.
-            setAsideUnreadable(filePath);
-            setAsideUnreadable(backup);
-            metadataCache = {};
-        }
+        metadataCache = {};
     }
     migrateLastActiveAt();
     return metadataCache;
+}
+
+/**
+ * Load the metadata now (no-op when already loaded).
+ * Call before irreversible steps that need the metadata later (e.g. creating an account), so that
+ * an unavailable store stops them before anything was changed.
+ * @throws {StoreUnavailableError}
+ */
+export function ensureUserMetadataLoaded() {
+    loadMetadata();
+}
+
+/**
+ * Load state for diagnostics / tests.
+ * @returns {{loaded: boolean, error: string|null, failedAt: number|null}}
+ */
+export function getMetadataLoadState() {
+    return {
+        loaded: metadataCache !== null,
+        error: loadFailure ? loadFailure.error.detail : null,
+        failedAt: loadFailure ? loadFailure.at : null,
+    };
 }
 
 /**
@@ -144,6 +159,35 @@ function migrateLastActiveAt() {
 }
 
 /**
+ * The store was loaded as missing but a metadata file appeared before the first write: merge that
+ * file into the cache (entries and fields only on disk are added, the in-memory changes win)
+ * instead of overwriting it, then write the result.
+ * @param {string} filePath
+ * @param {boolean} refreshBackup
+ * @returns {boolean}
+ */
+function mergeAppearedFile(filePath, refreshBackup) {
+    console.error('[STC-MOD] user-metadata.json appeared after the store was started empty; merging it instead of overwriting it.');
+    const result = readJsonFile(filePath, { validate: isPlainObject, backup: true, label: 'User metadata' });
+    if (result.status === 'ok' || result.status === 'recovered') {
+        for (const [key, value] of Object.entries(result.data)) {
+            const current = metadataCache[key];
+            if (!Object.hasOwn(metadataCache, key)) {
+                metadataCache[key] = value;
+            } else if (isPlainObject(current) && isPlainObject(value)) {
+                for (const [field, fieldValue] of Object.entries(value)) {
+                    if (!Object.hasOwn(current, field)) current[field] = fieldValue;
+                }
+            }
+        }
+    }
+    expectMissingFile = result.status === 'missing' || result.mainMissing === true;
+    writeJsonFileAtomic(filePath, metadataCache, { backup: refreshBackup, expectMissing: expectMissingFile });
+    expectMissingFile = false;
+    return true;
+}
+
+/**
  * Atomically persist the current cache to disk.
  * Writes to a temp file and renames over the target so readers never observe a
  * partially written file. Called by the flush scheduler only.
@@ -151,22 +195,22 @@ function migrateLastActiveAt() {
  * @returns {boolean} false when the write failed (the scheduler keeps the changes pending)
  */
 function writeMetadataFile(refreshBackup) {
+    // Never write anything that was not loaded successfully first
     if (!metadataCache) return true;
-    const filePath = getMetadataPath();
-    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    let filePath = '';
     try {
-        const data = JSON.stringify(metadataCache, null, 2);
-        fs.writeFileSync(tmpPath, data, 'utf8');
-        // Preserve the previous file as a backup before replacing it (real changes only).
-        if (refreshBackup && !skipNextBackup && fs.existsSync(filePath)) {
-            try { fs.copyFileSync(filePath, filePath + '.bak'); } catch { /* best-effort */ }
-        }
-        fs.renameSync(tmpPath, filePath);
-        skipNextBackup = false;
+        filePath = getMetadataPath();
+        writeJsonFileAtomic(filePath, metadataCache, { backup: refreshBackup, expectMissing: expectMissingFile });
+        expectMissingFile = false;
         return true;
-    } catch (e) {
-        console.error('[STC-MOD] Failed to save user metadata:', e.message);
-        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    } catch (writeError) {
+        let error = writeError;
+        try {
+            if (error instanceof StoreConflictError) return mergeAppearedFile(filePath, refreshBackup);
+        } catch (mergeError) {
+            error = mergeError;
+        }
+        console.error('[STC-MOD] Failed to save user metadata:', error?.detail || error?.message);
         return false;
     }
 }
@@ -182,6 +226,7 @@ const flushScheduler = createFlushScheduler({
  * Record a change and schedule the matching flush.
  * @param {boolean} activityOnly Only activity fields (lastActiveAt) changed
  * @param {boolean} immediate Flush synchronously right away
+ * @returns {boolean} false when the immediate flush failed (the change stays pending and is retried)
  */
 function scheduleFlush(activityOnly, immediate) {
     if (activityOnly) {
@@ -189,7 +234,7 @@ function scheduleFlush(activityOnly, immediate) {
     } else {
         flushScheduler.markReal();
     }
-    if (immediate) flushScheduler.flushNow();
+    return immediate ? flushScheduler.flushNow() : true;
 }
 
 /** Flush everything pending (activity included); used by the shutdown hooks. */
@@ -265,9 +310,11 @@ export function sanitizeMeta(meta) {
 }
 
 /**
- * Get extended data for a user
+ * Get extended data for a user.
+ * Every accessor below throws StoreUnavailableError while the metadata could not be loaded.
  * @param {string} handle User handle
  * @returns {UserExtendedData|null}
+ * @throws {StoreUnavailableError}
  */
 export function getUserMeta(handle) {
     const meta = loadMetadata();
@@ -296,15 +343,17 @@ export function isActivityOnlyPatch(data) {
  * @param {Partial<UserExtendedData>} data Data to merge
  * @param {object} [opts]
  * @param {boolean} [opts.immediate] Flush to disk synchronously instead of debounced.
+ * @returns {boolean} false when an immediate flush failed: the change is in memory and stays pending
+ *   (retried), but is not on disk yet
  */
 export function setUserMeta(handle, data, opts = {}) {
     const meta = loadMetadata();
-    if (!meta) return; // Defensive: should never happen
+    if (!meta) return false; // Defensive: should never happen
     if (!meta[handle]) {
         meta[handle] = {};
     }
     Object.assign(meta[handle], data);
-    scheduleFlush(isActivityOnlyPatch(data), opts.immediate === true);
+    return scheduleFlush(isActivityOnlyPatch(data), opts.immediate === true);
 }
 
 /**
@@ -367,10 +416,13 @@ export function isUserExpired(handle) {
 }
 
 /**
- * Find user handle by OAuth provider and user ID
+ * Find user handle by OAuth provider and user ID.
+ * Throws (never returns null) while the metadata is unavailable, so a login can never create a
+ * second account for an identity that is already linked.
  * @param {string} provider
  * @param {string} oauthUserId
  * @returns {string|null} handle or null
+ * @throws {StoreUnavailableError}
  */
 export function findUserByOAuth(provider, oauthUserId) {
     const meta = loadMetadata();
@@ -519,6 +571,7 @@ export function invalidateCache() {
         return false;
     }
     metadataCache = null;
-    skipNextBackup = false; // decided again by the next load
+    loadFailure = null; // the next access loads again right away
+    expectMissingFile = false;
     return true;
 }

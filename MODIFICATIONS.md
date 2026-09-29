@@ -331,6 +331,7 @@ src/stc-mod/
 ├── middleware/
 │   ├── csrf-exemption.js            # CSRF 豁免规则
 │   ├── trust-proxy.js               # 反代 trust proxy 配置
+│   ├── storage-enforce.js           # 存储配额拦截（请求分类、不增大的保存放行、异步统计）
 │   └── expiration-check.js          # 用户过期检查中间件
 ├── routes/
 │   ├── public/
@@ -358,10 +359,13 @@ src/stc-mod/
 │       ├── qrole-accounts.js        # QRole 账号列表、复核与过期账号清理（管理员）
 │       └── scheduled-tasks.js       # 定时任务（管理员）
 ├── services/
+│   ├── json-store.js                # JSON 数据文件读写（错误分类、.bak / .corrupt、原子写入、挂载检测与看门狗、503 映射）
+│   ├── data-root-watchdog.js        # 挂载看门狗检查循环（工作线程入口；挂载无响应时 SIGKILL）
+│   ├── announcements.js             # 公告数据（公开与管理路由共用）
 │   ├── email-service.js             # 邮件服务
 │   ├── invitation-codes.js          # 邀请码逻辑
 │   ├── system-monitor.js            # 系统监控
-│   ├── storage-quota.js             # 存储配额
+│   ├── storage-quota.js             # 存储配额、异步占用统计缓存、签到与扩容激活码
 │   ├── privacy-vault.js             # API 密钥保险箱（用户口令加密）
 │   ├── site-config.js               # 页面背景与站点信息（config.yaml `site`，校验 + 页面注入）
 │   ├── oauth-client.js              # OAuth HTTP / 客户端认证 / 身份解析（登录与后台复核共用）
@@ -379,7 +383,14 @@ src/stc-mod/
 │   ├── qrole-lifecycle.test.mjs     # QRole 到期处理纯逻辑测试（node 直接运行）
 │   ├── user-metadata-flush.test.mjs # user-metadata.json 刷盘策略测试（假时钟 / 模拟计时器 + 临时目录）
 │   ├── settings-safeguard.test.mjs  # settings.json 保护测试（临时目录 + 默认 settings.json 补齐）
-│   └── user-content-seed.test.mjs   # 新账号默认内容与补齐测试（临时目录 + 官方内容索引）
+│   ├── user-content-seed.test.mjs   # 新账号默认内容与补齐测试（临时目录 + 官方内容索引）
+│   ├── json-store.test.mjs          # 读取分类（ENOENT / EIO / EACCES / EISDIR）、.bak 恢复（含主文件缺失）、.corrupt 保留、expect-missing 冲突、挂载检测（启动失败、观察到的故障永久化）、看门狗（含工作线程）
+│   ├── user-metadata-unavailable.test.mjs # 元数据首次读取失败：抛错、节流重试、从不写入
+│   ├── stc-stores.test.mjs          # 保险箱 / 邀请码 / 公告 / 默认模板 / 监控历史 / QRole 清理在读取失败时的行为
+│   ├── register-unavailable.test.mjs # 注册在数据不可用时不建号；挂载消失时不解除 OAuth 绑定、不覆盖已有账号
+│   ├── gates-unavailable.test.mjs   # QRole 会话校验与到期检查在元数据不可用时返回 503
+│   ├── storage-quota.test.mjs       # 配额请求分类（对照官方路由）、变小 / 不变的保存、角色卡编辑额度、按增量预估、占用缓存（单飞 / 超时不叠加 / 预估 / 重新统计 / 未知）、限流器与统计的内存和并发上限
+│   └── storage-codes.test.mjs       # 存储激活码读取失败返回 503、不消耗激活码；上限保存失败时 persisted: false 并重试；数据不可用时不删除账号
 └── public/
     ├── login.html                   # 自定义登录页（含 OAuth 按钮）
     ├── register.html                # 注册页
@@ -404,6 +415,8 @@ src/stc-mod/
 | `qrole-cleanup-state.json` | QRole 过期账号清理的上次运行时间与结果 |
 | `qrole-cleanup-log.json` | QRole 过期账号清理的删除记录（最近 200 条） |
 
+以上文件都通过 `services/json-store.js` 读写：只有「文件不存在」视为空；内容无法解析时先从 `<文件>.bak` 恢复，没有可用备份时从空开始并把原文件复制为 `<文件>.corrupt-<时间戳>`；其他读取错误（EIO、ENOTCONN、EACCES、挂载消失等）抛出 `StoreUnavailableError`，接口返回 503，从不当成空数据、也不写回（见 [存储故障保护与配额统计](#存储故障保护与配额统计)）。写入均为临时文件 + rename（保留原权限）。
+
 QRole 刷新令牌的加密密钥 `stc-mod-token.key` **不在** `data/` 中，而是与 `config.yaml` 同目录（Docker：`config/stc-mod-token.key`），因为数据目录可能位于远程对象存储；需与配置一起备份。
 
 ## 配置项
@@ -412,6 +425,8 @@ QRole 刷新令牌的加密密钥 `stc-mod-token.key` **不在** `data/` 中，�
 
 ```yaml
 enableInvitationCodes: false    # 启用邀请码系统
+stcDataRootWatchdog: true       # 数据根目录挂载看门狗（代码默认值，不自动写入；只在数据根目录是单独挂载时生效）
+stcDataRootMustBeMount: false   # true：数据根目录不是单独挂载时 STC 数据不可用（503），看门狗开启时退出（代码默认值，不自动写入）
 enableRegistration: true        # 开放注册（false：隐藏注册入口并拒绝注册；QRole 会员首次登录仍自动开户）
 purchaseLink: ''                # 续费购买链接
 
@@ -561,7 +576,7 @@ enableDownloadableTokenizers: false
 | GET | `/api/stc/users/me-ext` | 获取当前用户扩展信息 |
 | POST | `/api/stc/users/renew` | 续费（使用邀请码） |
 | POST | `/api/stc/users/heartbeat` | 心跳（更新在线时间） |
-| GET | `/api/stc/users/storage` | 获取存储信息 |
+| GET | `/api/stc/users/storage` | 获取存储信息（新增 `unknown` / `pending` / `pendingMiB` / `computedAt`；未知时 `usedMiB` 等为 `null`、`canWrite: true`） |
 | POST | `/api/stc/users/check-in` | 每日签到 |
 | POST | `/api/stc/users/use-storage-code` | 使用存储激活码 |
 | GET | `/api/stc/users/password-status` | 检查当前用户密码状态 |
@@ -599,7 +614,7 @@ enableDownloadableTokenizers: false
 | POST | `/api/stc/announcements/create` | 创建公告 |
 | PUT | `/api/stc/announcements/:id` | 更新公告 |
 | POST | `/api/stc/announcements/delete` | 删除公告 |
-| GET | `/api/stc/scheduled-tasks/storage-analysis` | 用户存储分析（按用户统计聊天/角色卡/备份等） |
+| GET | `/api/stc/scheduled-tasks/storage-analysis` | 用户存储分析（按用户统计聊天/角色卡/备份等；读缓存，约 5 秒后返回部分结果，行内 `unknown` / `pending`，响应含 `pendingCount` / `unknownCount` / `complete`） |
 | POST | `/api/stc/scheduled-tasks/clean-backups` | 立即清理备份文件（指定用户或全部） |
 | GET/POST | `/api/stc/scheduled-tasks/config` | 获取/保存定时清理配置 |
 | GET/POST | `/api/stc/default-config/template` | 获取/保存新用户默认配置模板 |
@@ -760,6 +775,86 @@ QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有
 其他周期性写入（已检查，未修改）：`services/system-monitor.js` 每 5 分钟改写 `system-monitor-history.json`（最多 288 个点）并复制一份 `.bak`；`services/qrole-cleanup.js` 每小时检查、每 24 小时最多运行一次并写入状态 / 日志；`routes/private/scheduled-tasks.js` 每分钟检查，仅在备份清理到期时写 `config.yaml`。以上均不高于每 5 分钟一次。
 
 测试：`node src/stc-mod/tests/user-metadata-flush.test.mjs`、`node src/stc-mod/tests/settings-safeguard.test.mjs`、`node src/stc-mod/tests/user-content-seed.test.mjs`（不需要启动服务器，不访问网络；元数据测试的模拟计时器需要 Node ≥ 20.11）。
+
+## 存储故障保护与配额统计
+
+生产数据根目录位于 JuiceFS（Backblaze B2）FUSE 挂载上：juicefs 容器重启后应用容器内的挂载可能消失，同一路径随之指向下面 **空的** 本地目录（处处 ENOENT）；FUSE 进程异常时读取返回 ENOTCONN / EIO。远程读取故障绝不能被当成「没有数据」。全部实现位于 `src/stc-mod/` 与 `stc-admin-panel/`，**未修改官方文件，也未新增 `server-main.js` 钩子**。
+
+### 读取故障不等于空数据
+
+| 文件 | 说明 |
+|------|------|
+| `services/json-store.js`（新增） | `readJsonFile(file, { validate, backup, guard })` 返回 `ok` / `missing`（ENOENT，挂载检测仍通过，且没有可用的 `.bak`；损坏的 `.bak` 先复制为 `.bak.corrupt-<ts>`）/ `recovered`（主文件损坏或不存在、`.bak` 可用；损坏文件复制为 `.corrupt-<ts>`，下次写入不会用它覆盖 `.bak`；主文件不存在时带 `mainMissing: true`，首次写入按 expect-missing 创建）/ `corrupt`（无可用备份；主文件与损坏的 `.bak` 复制保留，复制失败则按不可用处理）；其他任何错误抛出 `StoreUnavailableError`（`code: 'STORE_UNAVAILABLE'`，`status: 503`，技术原因在 `.detail`）。读取前后都检查挂载（读到的也可能是挂载消失后下面的旧副本）；「无法读取」「已从 .bak 恢复」日志对同一文件版本最多每 10 分钟一条。`writeJsonFileAtomic()`：临时文件（保留原权限、fsync）+ rename，可选 `.bak`；`expectMissing`（数据按 `missing` 读入时）用硬链接创建目标，目标已存在则 `StoreConflictError`（重新读取而不覆盖），不支持硬链接时退回独占创建；链接成功后删除临时文件失败只记录日志（写入已完成，不报 503）。`createJsonStore({ label, file, validate, empty })` 提供 `read` / `load` / `update(mutator)`（冲突最多重试 3 次，未变化不写入；mutator 可能执行多次）/ `write`。挂载检测：`initDataRootGuard({ requireMount })` 在加载时记录数据根目录的设备号，设备号与 `/` 不同即视为单独挂载（生产中 `/mnt/jfs/fs/data` 位于挂载点 `/mnt/jfs/fs` 之内）；启动时 stat 出现 ENOENT 以外的错误（如 `ENOTCONN`），或 `stcDataRootMustBeMount: true` 而数据根目录不是单独挂载时，记为永久丢失（`lostReason`），直到重启都返回 503。此后每次读写 STC 数据前 `assertDataRootAvailable()` 确认仍可 stat 且设备号未变，否则 `StoreUnavailableError`（挂载消失导致的 ENOENT 不算 `missing`）。设备号检测发现不了「短暂消失后以相同设备号重新挂载」（Linux 复用匿名设备号），因此看门狗运行时，任何一次读写观察到的故障都是永久的（`markLost`）：之后不再读写，下一次检查退出。`startDataRootWatchdog()`：默认在工作线程（`services/data-root-watchdog.js`）中每 15 s 异步 stat 一次，失败或设备号变化时通知主线程记录错误、永久拒绝 STC 读写并 `process.exit(1)`（10 s 内仍未退出则由工作线程 SIGKILL）；stat 卡住 60 s（挂载无响应）时工作线程直接写 fd 2 日志并 SIGKILL（`process.exit` 会等待卡在 stat 中的线程池线程，永远不返回；主线程被同步调用卡住时计时器也照常运行）；stat 已等待 5 s 以上时 `checkDataRoot()` 直接拒绝，不再在主线程上同步 stat 卡住的挂载。启动时已不可用则立即退出。注入 `statAsync`（测试）时在主线程运行。HTTP：`sendStoreUnavailable` / `respondStoreError` / `storeErrorHandler` 返回 503 `{ error: '数据存储暂时不可用，请稍后重试', code: 'STORE_UNAVAILABLE' }`（`Retry-After: 30`；页面返回一行 503 文字） |
+| `services/data-root-watchdog.js`（新增） | 看门狗检查循环 `createWatchdogLoop()`（主线程与工作线程共用）与工作线程入口；与主线程通过 `SharedArrayBuffer` 共享「stat 等待起始时间」和「已丢失」标记（时间用 `performance.timeOrigin + performance.now()`，不受 `Date.now()` 改写影响） |
+| `config.js` | `getStcDataDir()` 先检查挂载，用 stat 判断目录，只在 ENOENT 时、并再次确认挂载后创建；其他错误为不可用。挂载消失时从不在下面的本地目录中创建目录 |
+| `user-metadata.js` | 首次读取失败（不可用）时不创建空缓存：每次访问都抛出，最多每 5 s（`LOAD_RETRY_MS`）重试一次；读取成功之前从不写入（包括退出钩子）。读取成功后内存缓存仍为唯一数据来源，写入失败保持待写并重试。按 `missing` 读入（或主文件不存在、从 `.bak` 恢复）后若文件在首次写入前出现，则合并进缓存（内存中的值优先）而不是覆盖。新增 `ensureUserMetadataLoaded()`、`getMetadataLoadState()`；`setUserMeta()` 返回布尔值（`immediate: true` 且写入失败时为 `false`） |
+| `services/invitation-codes.js`、`services/storage-quota.js`（存储激活码） | 改用 `createJsonStore`（读取错误抛出，不再返回 `[]`）。使用邀请码 / 激活码时先读取元数据（此时已不可用则不消耗任何码），再标记已用，再延长到期时间 / 提高上限（立即写入）。两次写入之间挂载恰好消失时，新值留在内存中待写并重试，记录一条带用户名、激活码和数值的错误日志，结果带 `persisted: false`；进程在重试成功前退出时激活码已用而新值未落盘，需要按日志手动补上 |
+| `services/announcements.js`（新增）、`routes/private/announcements.js`、`routes/public/announcements-public.js` | 公告读写集中到服务；读取错误返回 503；目录只在写入时创建 |
+| `services/privacy-vault.js`、`routes/private/privacy-vault.js`、`index.js` | 只有记录不存在才表示「未启用」；读取错误为 `StoreUnavailableError`（503），记录损坏为 `VaultRecordCorruptError`（500 `VAULT_RECORD_CORRUPT`，文件保留，可通过重置恢复）。启用使用 expect-missing，从不覆盖已有记录；重置先检查挂载，非 ENOENT 的删除错误视为不可用（官方代码因此不会在故障时清空已加密的密钥）。`index.js` 在官方 `POST /api/secrets/write` 之前检查受保护密钥的保险箱记录（503 / 500），密钥绝不会被当成未启用保险箱而明文保存。密钥 TTL 计时器改为 unref |
+| `services/default-template.js`、`routes/private/default-config.js` | 不存在或损坏 = 没有模板（损坏时记录日志并保留文件）；其他错误 503；目录只在保存时创建 |
+| `services/qrole-cleanup.js` | 状态与日志文件改用 json-store；运行前检查挂载、元数据与状态文件，任一不可用则跳过本次（不记录，下一次每小时检查重试）；删除前的最终检查在挂载失效时否决；运行中遇到不可用时以 `stopped: 'store_unavailable'` 停止，不记录为已完成 |
+| `services/system-monitor.js` | 历史只读取一次后保存在内存；读取失败期间新快照只保存在内存、从不写文件（不会用较短的历史覆盖），恢复后合并；首次读取成功前路由返回 503；无法测量数据根目录时磁盘信息带 `unknown: true` |
+| `services/user-deletion.js` | `deleteUserWithLock()` 在持锁后、调用方 precheck 之前检查挂载并加载元数据，不可用时返回 `{ success: false, skipped: 'store_unavailable' }`，不删除任何东西；每次删除尝试后使该用户的占用缓存失效 |
+| `services/settings-safeguard.js` | 挂载失效时不补写 `settings.json` |
+| `index.js`、`middleware/expiration-check.js`、`services/qrole-session.js` | 加载时初始化挂载检测、启动看门狗（`stcDataRootWatchdog`，默认 `true`；启动时 `getStcDataDir()` 失败只记录日志）；`storeErrorHandler` 最后注册，把任何 STC 路由抛出或 `next()` 的 `StoreUnavailableError` 映射为 503。登录拦截先查官方账号记录（无账号直接交给官方登录），元数据不可读时返回 503 而不是放行；QRole 会话校验在 `requireMembership` 开启时、元数据不可读返回 503 并保留会话（例外：管理员、未登录、`requireMembership: false`）；到期检查对非管理员返回 503；`/` 与 `/qrole-expired` 返回 503 页面 |
+| `routes/public/oauth.js`、`routes/public/register-helper.js`、`routes/public/register.js` | `findUserByOAuth` 不可用时抛出（不会为已绑定的身份新建第二个账号），回调重定向 `server_error`；建号前检查挂载并加载元数据（`createUser` 返回 `unavailable: true`，注册接口返回 503）；账号创建后兑换邀请码时存储不可用则回滚账号并返回 503；应用默认模板失败不影响注册。node-persist 把 ENOENT 读成「没有记录」，挂载消失时所有记录都「不存在」：`resolveLinkedAccount()` 只有在 `isAccountRecordGone()`（读取前后检查挂载、`_storage` 目录存在、重新读取记录）确认后才清除绑定，记录存在但不匹配时也先检查挂载；`createUser` / `createOAuthUser` 在写入官方记录与 `dropStaleMeta` 之前再用 `isAccountRecordGone()` 确认用户名空闲（前面的查找可能正好碰上挂载消失），否则不建号 |
+| 其余路由（`user-extend.js`、`user-storage.js`、`invitation-codes.js`、`set-password.js`、`qrole-status.js`、`qrole-accounts.js`、`qrole-export.js`、`scheduled-tasks.js`） | 所有 try/catch 先 `respondStoreError()`（503），同步路由经 `storeErrorHandler`。批量 / 单个删除用户、清理不活跃用户先检查挂载与元数据，挂载丢失时立即停止；候选只从已加载的元数据中选出；「重置用户」与备份清理在挂载失效时返回 503，不在本地目录中重建文件夹 |
+
+已检查、无需修改（均为失败即拒绝）：`password-migration`（记录日志、不写入；无密码仅凭用户名的登录仍由拦截器阻止）、`qrole-reverify`（错误视为暂时性，从不删除）。
+
+官方数据（node-persist `_storage`、用户目录）不在范围内：挂载消失后已登录请求一般先因官方会话查找失败返回 403，看门狗随后重启进程。
+
+### 存储配额：删除与不增大的保存从不拦截
+
+`middleware/storage-enforce.js`（在 `setupPublicRoutes` 中注册，位于全局 body parser 与 `setUserDataMiddleware` 之后、官方路由与 multer 之前）改为异步中间件，`classifyRequest(method, path)` 先按 Express 的匹配方式规范化路径（小写、合并重复斜杠、去掉结尾斜杠；此前 `/API/Files/Upload/` 可绕过配额），`/api/stc/*` 与 GET/HEAD 从不检查：
+
+- **free（从不拦截，成功后约 1.5 s 重新统计）**：任何 `DELETE` 请求，以及最后一段为 `delete` / `remove` / `rename` / `clear` / `purge` 的 `/api/...` POST。
+- **write（超额时 507）**：`BLOCKED_ROUTES` 中的精确路由，以及四个上传前缀下除只读路由外的所有 POST（官方以后新增的上传路由默认受限）。
+- **read / none（从不拦截）**：上传前缀下的只读路由，以及其他所有请求。
+
+对照 `src/endpoints/*.js` 中官方 `router.post(...)` 的分类（`tests/storage-quota.test.mjs` 读取 13 个官方路由文件，新增或改变分类而未更新此表时测试失败）：
+
+| 前缀 | write（超额拦截） | read / 不检查 | free（从不拦截） |
+|------|------------------|---------------|------------------|
+| `/api/files` | `upload` | `sanitize-filename`、`verify` | `delete` |
+| `/api/images` | `upload` | `list`、`list/:folder`、`folders` | `delete` |
+| `/api/sprites` | `upload`、`upload-zip` | （`GET /get`） | `delete` |
+| `/api/backgrounds` | `upload` | `all`、`folders` | `delete`、`rename` |
+| `/api/chats` | `save`（变小或内容不变时放行）、`group/save`（同上）、`import`、`group/import` | `get`、`export`、`group/get`、`group/info`、`search`、`recent` 等 | `delete`、`rename`、`group/delete` |
+| `/api/characters` | `create`、`import`、`duplicate`、`edit-avatar`；`edit`、`edit-attribute`、`merge-attributes`（请求 ≤ 1 MiB 时放行） | `all`、`get`、`chats`、`export` | `delete`、`rename` |
+| `/api/worldinfo` | `edit`（不增大时放行）、`import` | `list`、`get` | `delete` |
+| `/api/backups` | – | `chat/get`、`chat/download` | `chat/delete` |
+| `/api/avatars` | `upload` | `get` | `delete` |
+| `/api/groups` | `create` | `all`、`edit` | `delete` |
+| `/api/content` | `importURL`、`importUUID` | – | – |
+| `/api/assets` | `download` | `get`、`character` | `delete` |
+| `/api/extensions` | `install` | `update`、`branches`、`switch`、`move`、`version` | `delete` |
+
+超额时的保存检查（`resolveSaveTargetPath()` / `resolveShrinkTarget()` / `checkShrinkingSave()`）按官方处理器解析目标文件：聊天 `chats/<avatar_url 去掉 .png>/sanitize(<file_name>.jsonl)`（含 `avatar_url` 校验与 `isPathUnderParent`），新大小为 `chat.map(JSON.stringify).join('\n')` 的字节数；群聊 `groupChats/sanitize(<id>.jsonl)`（必须直接位于该目录）；世界书 `worlds/sanitize(<name>.json)`（同官方的 `entries` 检查），新大小为 `JSON.stringify(data, null, 4)`。聊天与群聊只在新大小 **小于** 现有大小时放行：官方每次保存聊天都会（每个聊天最多每 10 s 一次）写入一份 **完整** 的备份，每个角色 / 群聊最多保留 `backups.common.numberOfBackups`（默认 50）份，`backups.chat.maxTotalBackups` 默认 `-1` 没有总数上限，所以反复提交「不变大」的保存会把备份放大到聊天大小的数十倍。大小相同时读取现有文件逐字节比较：完全相同（酒馆在切换角色等操作时会重新保存未改动的聊天）由中间件直接返回官方的 `{ ok: true }`，不调用官方处理器（无需写入，也不产生备份）；内容不同则 507。世界书没有备份，新大小 ≤ 现有大小即放行。无法安全解析、文件不存在、不是文件或无法读取（EIO 等）时仍拦截。启用配额的部署建议设置 `backups.chat.maxTotalBackups`。角色卡编辑（`edit`、`edit-attribute`、`merge-attributes`）在 multer 之前无法解析 multipart 表单、找不到对应的卡片，超额时按 Content-Length ≤ `CARD_EDIT_ALLOWANCE_BYTES`（1 MiB）放行（没有 Content-Length 时拦截）：每张卡片最多增大几 MiB，超额时无法新建卡片。507 响应结构不变（`error`、`code: 'STORAGE_QUOTA_EXCEEDED'`、`message`、`usedMiB`、`limitMiB`、`percent`），`message` 提示删除聊天或消息、角色卡、背景图片或聊天备份（删除不受限制），或联系管理员扩容。检查失败时的「Storage quota check failed ... allowing」警告每个用户每分钟最多一条（附带省略的次数）。
+
+仍不受配额限制的写入（单个文件被整体替换、不会无限累积，或属于维护操作）：`/api/settings/save` 与设置快照、预设 / 主题 / 快速回复 / 界面布局保存、`/api/groups/edit`、`/api/vector/insert`、扩展更新 / 切换 / 移动。
+
+### 占用统计：不再在保存前同步扫描用户目录
+
+`services/storage-quota.js` 删除了同步的 `calculateUserStorage`；每个用户的占用缓存为 `{ bytes, categories, computedAt, pendingBytes, errorAt, error }`（`categories`：按顶层目录统计的字节数，供存储分析使用）：
+
+- **统计**：`measureDirectory()` 完全异步，所有统计共用一个限流器，并发文件操作数为 libuv 线程池大小减 1（`UV_THREADPOOL_SIZE`，默认 4 → 3，最多 16），其他异步文件读写（官方请求、看门狗）总有空闲线程；限流队列按下标出队（`Array#shift` 在大队列上是 O(n)，12 万个文件的统计因此变成平方级）。每次统计固定数量的工作协程按「先文件、后子目录」深度优先处理，只保存正在处理的目录列表，不会为每个文件预先创建任务；可用 `AbortSignal` 中止（下一个文件操作前停止）。统计期间被删除的文件跳过；统计前后都检查挂载（统计中途挂载消失时剩余目录看起来「已删除」，结果按未知处理而不是缓存一个偏小的值）。同一用户同时只有一次统计（单飞，直到统计真正结束）；`invalidate()` 丢弃并中止正在进行的统计。
+- **未知而不是 0**：任何错误（包括用户目录不存在、挂载检测报告挂载丢失或设备变化）得到 `null`（未知），不会缓存为 0；失败后 30 s 内不重试。
+- **超过 2 分钟的统计**：不再有人等待它（从未统计过的用户显示未知、错误 `ETIMEDOUT`，已有旧值的继续使用旧值），但仍占用该用户的单飞位置，不会再为同一目录开始第二次统计；它最终完成时结果照常缓存（以前超时后结果被丢弃，30 s 后又开始新的统计，同一目录的统计越叠越多，占用永远未知，配额不再生效）。
+- **新鲜度与等待**：结果 10 分钟内直接使用；配额检查最多等待 8 s，`/me-ext`、`/storage`、`/can-write` 最多等待 3 s，超时后使用旧值或未知值，统计在后台继续。
+- **未知时放行**：占用未知时允许写入，每个用户最多每 5 分钟记录一条警告。
+- **写入后**：2xx 写入把预估增量加入 `pendingBytes`，并在第一次写入后 30 s 内重新统计（后续写入不会推迟）；统计期间发生的写入保持待计入。聊天 / 群聊 / 世界书保存（`estimateSaveGrowth()`）按目标文件增大的字节数计入（写入前 stat 现有文件；聊天的新大小用 Content-Length 近似，不再重复序列化；新文件全额计入），而不是每次都把整份聊天当作新数据，接近上限的用户不会因为连续两次保存被误判超额；其他写入按 Content-Length（或上传文件大小 + 请求体大小）计入。
+- **仅因预估超额**：用户只是因为 `pendingBytes` 超出上限时，拒绝前先重新统计（上次统计不足 5 s 时除外），避免每次保存整份聊天的预估造成误报 507。
+- **删除 / 改名后**：约 1.5 s 后重新统计；此时若有统计正在进行，结束后再统计一次。
+- **管理员列表**：`/api/stc/user-storage/all-users`、QRole 账号列表 / 清理预览、存储分析同时最多统计 4 个用户，5 s 后返回部分结果（未完成的为 `unknown` / `pending`），统计在后台继续填充缓存；按名称排序时只统计当前页。清理不活跃用户 / 发送提醒按存储过滤时，占用未知的用户会被跳过（从不作为删除候选）。
+- **返回字段**：原有字段含义不变，新增 `unknown`、`pending`、`pendingMiB`、`computedAt`；未知时 `usedMiB`、`percent`、`remainingMiB` 为 `null`，`canWrite` 为 `true`。`getUserStorageInfo()` / `canUserWrite()` 仍保留，但只读缓存（从不扫描）；异步版本为 `getUserStorageInfoAsync()` / `canUserWriteAsync()`。
+- **缓存失效**：删除用户（`deleteUserWithLock`）、重置用户、管理员修改用户上限时立即失效；重新开启配额功能时清空全部缓存。签到与激活码只修改上限（上限不缓存）。官方 `/api/users/delete` 无法挂钩，重新创建同名账号最多约 10 分钟内可能看到旧的占用。
+- **备份清理**：`/api/stc/scheduled-tasks/clean-backups` 与定时清理改为异步、同时最多 4 个用户，完成后触发重新统计；挂载失效时拒绝执行。
+- **管理面板**（`stc-admin-panel/index.js`、`admin-panel.js`）：显示「统计中…」「未知」「约 X MiB」，未知时不显示进度条；存储分析表显示待统计数量。
+
+负载：每个活跃写入的用户大约每 30 s 触发一次异步统计（远少于以前每次保存前的同步全量扫描）；间隔常量均从 `storage-quota.js` 导出，可按需调大。
+
+测试：`node src/stc-mod/tests/json-store.test.mjs`、`user-metadata-unavailable.test.mjs`、`stc-stores.test.mjs`、`register-unavailable.test.mjs`、`gates-unavailable.test.mjs`、`storage-quota.test.mjs`、`storage-codes.test.mjs`（不需要启动服务器，不访问网络）。
 
 ## 页面背景与站点信息（`site` 配置）
 

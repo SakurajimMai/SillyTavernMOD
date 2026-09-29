@@ -143,6 +143,17 @@ async function getCsrfHeaders() {
     };
 })();
 
+/**
+ * Used storage for display: MiB (prefixed with 约 while a recount is pending), or a placeholder when
+ * the usage is unknown (still being counted / not readable).
+ * @param {object} s Storage info from /api/stc/users/me-ext
+ * @returns {string}
+ */
+function storageUsedText(s) {
+    if (s.unknown) return s.pending ? '统计中…' : '未知';
+    return `${s.pending && s.pendingMiB > 0 ? '约 ' : ''}${s.usedMiB}`;
+}
+
 let _storageToastTimeout = null;
 function showStorageQuotaToast(data) {
     // Remove any existing toast
@@ -183,7 +194,7 @@ function showStorageQuotaToast(data) {
         </div>
         <div style="font-size:.8em;color:#aaa;display:flex;align-items:center;gap:6px">
             <i class="fa-solid fa-lightbulb" style="color:#f39c12"></i>
-            提示：删除不需要的聊天记录或角色卡以释放空间，或联系管理员扩容。
+            提示：删除不需要的聊天/消息、角色卡、背景或聊天备份即可释放空间（删除不受限制），或联系管理员扩容。
             <a href="#" onclick="document.getElementById('stc-quota-toast').remove();showUserPanel();return false;"
                style="color:#8ab4f8;white-space:nowrap">查看详情</a>
         </div>`;
@@ -970,12 +981,13 @@ function injectUserInfo() {
     }
     if (userExtInfo.storage?.enabled) {
         const s = userExtInfo.storage;
-        const pct = s.percent;
+        // Usage unknown (still being counted / not readable): no bar, never shown as over quota
+        const pct = s.unknown ? 0 : (s.percent ?? 0);
         const isOverQuota = pct >= 100;
         const barColor = isOverQuota ? '#e74c3c' : pct >= 90 ? '#e74c3c' : pct >= 70 ? '#f39c12' : '#4a90e2';
         html += `<div style="font-size:11px;margin-top:3px;margin-bottom:2px;display:flex;align-items:center;gap:4px">
             ${isOverQuota ? '<i class="fa-solid fa-triangle-exclamation" style="color:#e74c3c;font-size:10px"></i>' : ''}
-            <span style="color:${pct >= 90 ? '#e74c3c' : '#aaa'}">${s.usedMiB}</span>
+            <span style="color:${pct >= 90 ? '#e74c3c' : '#aaa'}">${storageUsedText(s)}</span>
             <span style="color:#666"> / </span>
             <span>${s.limitMiB} MiB</span>
             ${isOverQuota ? '<span style="color:#e74c3c;font-size:9px;font-weight:600">超限</span>' : ''}
@@ -1321,7 +1333,7 @@ function buildUserPanelContent(purchaseLink = '') {
     // ━━━━ 4. Storage Card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (me.storage?.enabled) {
         const s = me.storage;
-        const pct = s.percent;
+        const pct = s.unknown ? 0 : (s.percent ?? 0);
         const barColor = pct >= 90 ? '#e74c3c' : pct >= 70 ? '#f39c12' : '#4a90e2';
         const today = new Date().toISOString().split('T')[0];
         const alreadyCheckedIn = s.lastCheckInDate === today;
@@ -1333,7 +1345,7 @@ function buildUserPanelContent(purchaseLink = '') {
                 <div style="font-weight:600;font-size:.88em;opacity:.7;display:flex;align-items:center;gap:6px">
                     <i class="fa-solid fa-hard-drive"></i> 存储空间
                 </div>
-                <div style="font-size:.82em;opacity:.6">${s.usedMiB} / ${s.limitMiB} MiB</div>
+                <div style="font-size:.82em;opacity:.6">${storageUsedText(s)} / ${s.limitMiB} MiB</div>
             </div>
             <div>
                 <div style="background:var(--SmartThemeBorderColor,rgba(255,255,255,.12));border-radius:6px;height:10px;overflow:hidden">
@@ -1341,8 +1353,8 @@ function buildUserPanelContent(purchaseLink = '') {
                         width:${Math.min(pct, 100)}%;transition:width .5s ease"></div>
                 </div>
                 <div style="display:flex;justify-content:space-between;font-size:.78em;margin-top:5px;opacity:.55">
-                    <span style="color:${pct >= 90 ? '#e74c3c' : 'inherit'}">${pct}% 已使用</span>
-                    <span>剩余 ${s.remainingMiB} MiB</span>
+                    <span style="color:${pct >= 90 ? '#e74c3c' : 'inherit'}">${s.unknown ? (s.pending ? '用量统计中，请稍后刷新' : '用量暂时无法统计') : `${pct}% 已使用`}</span>
+                    <span>${s.unknown ? '' : `剩余 ${s.remainingMiB} MiB`}</span>
                 </div>
             </div>`;
 
@@ -1494,7 +1506,7 @@ function bindUserPanelButtons(content, popup) {
                     const s = userExtInfo.storage;
                     if (s) {
                         const bar = content.querySelector('#stc-storage-bar');
-                        if (bar) bar.style.width = `${Math.min(s.percent, 100)}%`;
+                        if (bar) bar.style.width = `${s.unknown ? 0 : Math.min(s.percent ?? 0, 100)}%`;
                     }
                 }
                 if (btn) {
@@ -1505,7 +1517,7 @@ function bindUserPanelButtons(content, popup) {
                     btn.style.cursor = 'not-allowed';
                 }
             } else {
-                showMsg(d.reason || '签到失败', false);
+                showMsg(d.reason || d.error || '签到失败', false);
                 if (btn) { btn.disabled = false; btn.innerHTML = `<i class="fa-solid fa-gift"></i> 每日签到 +${userExtInfo.storage?.dailyCheckInMiB} MiB`; }
             }
         } catch (e) {
@@ -1530,7 +1542,7 @@ function bindUserPanelButtons(content, popup) {
                 const meResp = await fetch('/api/stc/users/me-ext');
                 if (meResp.ok) userExtInfo = await meResp.json();
             } else {
-                showMsg(d.reason || '激活失败', false);
+                showMsg(d.reason || d.error || '激活失败', false);
             }
         } catch (e) { showMsg('请求失败: ' + e.message, false); }
     });
