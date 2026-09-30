@@ -187,7 +187,10 @@ logging:
   # Records new connections with timestamp, IP address and user agent
   enableAccessLog: true
   # Minimum log level to display in the terminal (DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3)
-  minLogLevel: 0
+  # STC-MOD: default INFO. DEBUG (0) prints the full request of every AI generation (the whole chat
+  # context, often 50-130 KB each) into the console / Docker log: user chats in plain text and a
+  # log that grows quickly. Use 0 only temporarily for troubleshooting.
+  minLogLevel: 1
 # -- RATE LIMITING CONFIGURATION --
 rateLimiting:
   # Use any of the enabled headers in the `forwardedHeaders` section to identify the client IP for rate limiting.

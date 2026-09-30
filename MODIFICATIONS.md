@@ -332,6 +332,7 @@ src/stc-mod/
 │   ├── csrf-exemption.js            # CSRF 豁免规则
 │   ├── trust-proxy.js               # 反代 trust proxy 配置
 │   ├── storage-enforce.js           # 存储配额拦截（请求分类、不增大的保存放行、异步统计）
+│   ├── socket-close-listeners.js    # 保留 Node 自己的 socket 'close' 监听器（修复流式生成内存泄漏）
 │   └── expiration-check.js          # 用户过期检查中间件
 ├── routes/
 │   ├── public/
@@ -390,7 +391,10 @@ src/stc-mod/
 │   ├── register-unavailable.test.mjs # 注册在数据不可用时不建号；挂载消失时不解除 OAuth 绑定、不覆盖已有账号
 │   ├── gates-unavailable.test.mjs   # QRole 会话校验与到期检查在元数据不可用时返回 503
 │   ├── storage-quota.test.mjs       # 配额请求分类（对照官方路由）、变小 / 不变的保存、角色卡编辑额度、按增量预估、占用缓存（单飞 / 超时不叠加 / 预估 / 重新统计 / 未知）、限流器与统计的内存和并发上限
-│   └── storage-codes.test.mjs       # 存储激活码读取失败返回 503、不消耗激活码；上限保存失败时 persisted: false 并重试；数据不可用时不删除账号
+│   ├── storage-codes.test.mjs       # 存储激活码读取失败返回 503、不消耗激活码；上限保存失败时 persisted: false 并重试；数据不可用时不删除账号
+│   ├── socket-close-listeners.test.mjs # socket 'close' 监听器保护：单元测试 + 真实 HTTP(S) 服务器（keep-alive、pipelining、断开即中止上游、强制 GC 的泄漏对比）
+│   └── fixtures/
+│       └── socket-close-leak-server.mjs # 泄漏对比测试的子进程（--expose-gc，官方写法的流式生成接口）
 └── public/
     ├── login.html                   # 自定义登录页（含 OAuth 按钮）
     ├── register.html                # 注册页
@@ -662,6 +666,7 @@ enableDownloadableTokenizers: false
 | `req.user.profile.handle` | 私有路由用此获取当前用户 handle |
 | `csrfSync` 配置结构 | `skipCsrfProtection` 回调参数是否变更 |
 | `express.static` 调用位置 | 静态资源缓存策略应仍位于 `webpackMiddleware` 之后、公开 API 路由之前 |
+| 官方 `request.socket.removeAllListeners('close')`、Node 版本 | 见「流式生成的内存泄漏修复」：升级官方代码或 Node 后运行 `node src/stc-mod/tests/socket-close-listeners.test.mjs`（其中的对照测试确认官方写法仍会删除 Node 的监听器；官方不再这样写时可以移除该中间件） |
 
 ### 快速验证步骤
 
@@ -857,6 +862,51 @@ QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有
 
 测试：`node src/stc-mod/tests/json-store.test.mjs`、`user-metadata-unavailable.test.mjs`、`stc-stores.test.mjs`、`register-unavailable.test.mjs`、`gates-unavailable.test.mjs`、`storage-quota.test.mjs`、`storage-codes.test.mjs`（不需要启动服务器，不访问网络）。
 
+## 流式生成的内存泄漏修复（socket `close` 监听器）
+
+官方生成接口共 23 处（`src/endpoints/backends/chat-completions.js` 13 处，`text-completions.js`、`kobold.js`、`google.js`、`horde.js`、`novelai.js`、`openai.js` 各 1 处，`stable-diffusion.js` 4 处）在请求开始时执行：
+
+```javascript
+request.socket.removeAllListeners('close');
+request.socket.on('close', function () {
+    controller.abort();
+});
+```
+
+本意是去掉同一 keep-alive 连接上前一个请求留下的中止监听器，但它同时删除了 Node HTTP(S) 服务器自己注册在该 socket 上的 `close` 监听器：每个连接的 `socketOnClose`（释放 HTTP 解析器，从而把连接移出服务器的连接列表）、当前响应的 `onServerResponseClose`，TLS 连接还有 `onSocketClose` / `onSocketCloseDestroySSL`。连接关闭后 socket 仍被服务器的连接列表引用，连同其余监听器闭包引用的请求、响应、解析后的请求体（完整提示词）、上游响应及其 socket 全部无法回收：130 KB 提示词的流式生成每次约 0.30 MB 堆 + 0.14 MB ArrayBuffer，直到进程重启。全部修复位于 `src/stc-mod/`，**未修改官方文件，也未新增 `server-main.js` 钩子**。
+
+| 文件 | 说明 |
+|------|------|
+| `middleware/socket-close-listeners.js`（新增） | `protectSocketCloseListeners(socket)`：每个 socket 只处理一次（`Symbol.for('stc-mod.socketCloseListeners')` 标记，幂等），把此刻的 `rawListeners('close')` 记为内部监听器（`WeakSet`，不保留任何对象），并在该 socket 实例上定义不可枚举的 `removeAllListeners`：参数为 `'close'` 时从后往前逐个 `removeListener` 不在集合中的监听器（顺序与 EventEmitter 原实现相同），保留的监听器顺序与 `once` 包装不变，`removeListener` 事件只针对真正删除的监听器，返回 `this`。其他情况一律调用原方法：其他事件、无参数的 `removeAllListeners()`、在其他对象上调用、HTTP 解析器已释放的 socket（升级或已关闭，Node 将 `socket.parser` 置为 `null`；仅在记录时 `parser` 存在才启用此判断）。不修改 `net.Socket` 原型，其他 socket 不受影响。`createSocketCloseListenerGuard()`：对每个请求调用上述函数后 `next()`；没有 socket 或不是 EventEmitter 时直接放行，打补丁出错只记录日志、请求照常继续 |
+| `index.js` | `setupPublicRoutes` 中第一个注册（在数据根目录写入保护之前、所有官方路由之前） |
+
+**如何识别 Node 的内部监听器**：socket 的第一个请求到达该中间件时，这个连接上还没有运行过任何应用代码（官方路由都注册在它之后），此时的 `close` 监听器都是 Node 添加的（官方前置中间件 helmet / compression / body-parser / cors / whitelist / cookie-session / CSRF 在正常路径上不添加；body-parser 出错路径的 on-finished 闭包在请求结束时自行移除）。之后第一次出现的监听器函数一律视为应用的。Node 为每个响应重新添加的 `onServerResponseClose` 是同一个函数，按引用识别，同一连接后续请求时仍被保留。
+
+**为什么不在每个请求重新快照**：keep-alive 连接上第 2 个请求到达时，第 1 个请求的中止监听器（以及 `forwardFetchResponse` 的监听器）仍在 socket 上——官方代码要等下一次 `removeAllListeners('close')` 才删除它。按请求快照会把它当成内部监听器保留，并在同一连接上逐请求累积（Cloudflare 回源连接可以长期复用）；因此只在第一次记录，之后的「刷新」隐含在按当前监听器逐个判断中。
+
+**边界情况**：HTTP/1.1 keep-alive 与 pipelining（后一个请求删除前一个请求的中止监听器，与官方行为相同；Node 的监听器始终保留）；HTTPS / TLS socket（TLS 的两个监听器同样保留）；升级后的 socket（Express 不处理升级请求；解析器释放后恢复原行为）；没有 socket 的请求；`res` 上的监听器不受影响（只改 socket 的 `removeAllListeners`）。客户端断开时当前请求的中止监听器照常触发，上游请求被中止。
+
+**验证**：
+
+- `tests/socket-close-listeners.test.mjs`（`node src/stc-mod/tests/socket-close-listeners.test.mjs`，约 5 s，HTTPS 用例需要 `openssl`，没有时跳过）：
+  - 单元测试（`net.Socket` / EventEmitter）：内部监听器（含 `once`）保留、应用监听器删除、顺序不变；keep-alive 模拟（第 2 个请求删除第 1 个请求的中止监听器，Node 重新添加的函数仍被识别）；幂等；其他事件 / 无参数调用 / 其他 socket 与原型不变；`removeListener` 事件与原方法一致；解析器释放后恢复原行为；无 socket、无法打补丁时放行。
+  - 真实 HTTP 服务器 + Express：4 个 keep-alive 请求与 3 个 pipelining 请求，每次执行官方写法后 Node 的监听器全部仍在、应用监听器只剩当前请求的中止监听器；对照组（不注册中间件）确认官方写法确实删除 Node 的监听器；HTTPS 同样验证 TLS 监听器。
+  - 客户端断开：同一 keep-alive 连接上两次完整生成后，第三次生成（node-fetch + 官方 `forwardFetchResponse`）在收到第一段后由客户端断开，模拟上游看到连接被中止，且只有当前请求的 `AbortController` 被触发（前两次的中止监听器已被删除）。
+  - 泄漏对比（子进程 `--expose-gc`，`tests/fixtures/socket-close-leak-server.mjs`，官方写法 + 官方 `forwardFetchResponse`，120 KB 提示词，150 次生成、每次独立连接，强制 GC）：无中间件时 150 个请求对象全部残留、堆 +41.9 MB、ArrayBuffer +18.1 MB；有中间件时残留 0 个、堆 +0.3 MB、ArrayBuffer +0。断言按比例（残留 ≥ 90% / ≤ 5%，增长 < 1/10），不依赖具体数值。
+- 真实服务器（`/tmp` 中的独立副本，127.0.0.1:8160，本地数据目录，模拟 LLM 以 SSE 流式返回 100 个 token，`custom` 来源的流式 chat completion，168 条消息 ≈ 130 KB 提示词，10 并发；`--inspect` 仅用于强制 GC，测量前丢弃 inspector 保存的控制台消息）。heapUsed / arrayBuffers（MB），均为强制 GC 之后：
+
+| 阶段 | 无修复 | 有修复 |
+|------|--------|--------|
+| 启动后 | 80.8 / 0.3 | 80.9 / 0.3 |
+| 预热 20 次 | 88.7 / 3.0 | 82.8 / 0.3 |
+| +200 次（每次独立连接，响应后关闭） | 148.3 / 31.4 | 80.8 / 0.3 |
+| +400 次 | 207.1 / 59.5 | 80.7 / 0.3 |
+| +400 次 keep-alive（10 个连接复用，结束时关闭） | 209.9 / 60.9 | 80.8 / 0.3 |
+| 再 +800 次独立连接（累计 1620 次） | 440.8 | 80.7 |
+| 残留 IncomingMessage / ServerResponse / Socket（累计 1620 次） | 2464 / 1233 / 2466 | 2 / 2 / 4 |
+
+无修复时每个关闭的连接残留约 0.30 MB 堆 + 0.14 MB ArrayBuffer（RSS 在 420 次后 373 MB，有修复时 203 MB）；keep-alive 时每个连接只残留最后一次生成，所以按「关闭的连接数」泄漏。有修复时累计 1620 次生成内存不增长。客户端在第一段后断开时，模拟上游在两种情况下都看到中止（有修复时另在同一 keep-alive 连接上两次完整生成之后验证）。
+
 ## 页面背景与站点信息（`site` 配置）
 
 欢迎页 / 登录页 / 注册页原先写死的背景（`t.alcy.cc` 视频与图片、渐变底色、遮罩、樱花）与站点文字（标题、角标、副标题、Logo、功能卡片）改为读取 `config.yaml` 的 `site` 段，默认值与原页面完全一致。全部实现位于 `src/stc-mod/` 与 `default/config.yaml`，**未新增 `server-main.js` 钩子**（仍为 6 个）。
@@ -878,12 +928,35 @@ QRole 新增 `membership` 授权范围：userinfo 返回 `membership_tier`（有
 | 文件 | 作用 |
 |------|------|
 | `docker/docker-compose.s3.yml` | JuiceFS + SillyTavern（+ 可选 `--profile redis` 本地 Redis）；元数据默认走外部 MariaDB/MySQL（`JFS_META_URL`）；通过 `SILLYTAVERN_DATAROOT=/mnt/jfs/fs/data` 把数据根目录放到 JuiceFS |
-| `docker/juicefs/entrypoint.sh` | 首次运行 `juicefs format`（仅当元数据报告未格式化；桶内已有数据时 JuiceFS 拒绝格式化并提示恢复）；已格式化时每次启动 `juicefs config` 同步 `s3.env` 中的密钥；之后前台 `juicefs mount` |
+| `docker/juicefs/entrypoint.sh` | 首次运行 `juicefs format`（仅当元数据报告未格式化；桶内已有数据时 JuiceFS 拒绝格式化并提示恢复）；已格式化时每次启动 `juicefs config` 同步 `s3.env` 中的密钥与回收站天数，并检查缓存目录中待上传 / stuck 的暂存数据块；之后前台 `juicefs mount`（`JFS_WRITEBACK` 开启或仍有待上传数据块时加 `--writeback`，见下方「写回缓存」）；`sh /juicefs-entrypoint.sh pending` 在运行中的容器里输出待上传数量 |
 | `docker/juicefs/migrate-local-data.sh` | 把旧本地 `data/` 一次性复制进 JuiceFS（有运行中/挂载/非空目标检查） |
-| `docker/s3.env.example` | 存储桶与密钥模板（实际 `docker/s3.env` 已忽略） |
+| `docker/s3.env.example` | 存储桶与密钥模板（实际 `docker/s3.env` 已忽略）；`JFS_WRITEBACK` 的风险与运维说明 |
 
 `.dockerignore` 排除了 `docker/juicefs`：构建上下文是仓库根目录，若不排除，`docker build` 会遍历整个挂载的存储桶。
 依赖上游行为：`src/healthcheck.js` 与 `getConfigValue('dataRoot')` 均读取 `SILLYTAVERN_DATAROOT`；STC-MOD 的 `getDataRoot()` 使用 `globalThis.DATA_ROOT`。
+
+### 日志级别与日志轮转
+
+| 文件 | 说明 |
+|------|------|
+| `default/config.yaml` | `logging.minLogLevel` 默认值由 `0`（DEBUG）改为 `1`（INFO），并注明原因：DEBUG 时官方后端用 `console.debug('<API> request:', body)` 打印每次 AI 生成的完整请求（整段聊天上下文，常见 50–130 KB/次），用户聊天以明文进入控制台 / Docker 日志，日志快速膨胀。只影响新安装（官方启动流程只补缺失的键，已有值不改）；官方代码在该键缺失时仍按 DEBUG 处理 |
+| `docker/docker-compose.yml`、`docker/docker-compose.s3.yml` | 顶层扩展字段 `x-logging: &default-logging`（`json-file`，`max-size: 20m`，`max-file: 5`），每个服务 `logging: *default-logging`；此前未设置时 Docker 日志无上限，与其他服务共用宿主机硬盘 |
+| `README.md` | 方式 A 的 `docker run` 加 `--log-opt max-size=20m --log-opt max-file=5`；「查看日志」「上线前配置清单」「从旧版本升级」补充日志级别与轮转说明 |
+
+### 写回缓存（`JFS_WRITEBACK`）
+
+`s3.env` 中的 `JFS_WRITEBACK=1` 让 `juicefs mount` 加 `--writeback`：保存只写入本机缓存目录的 `rawstaging/` 后返回，由 JuiceFS 在后台上传（默认关闭；用户文档见 README「用户数据存储到 S3」第 8 节）。
+
+- **取值**：去掉空白、不区分大小写；`1` / `true` / `yes` / `on` 开启，`0` / `false` / `no` / `off` / 空为关闭；其他值按关闭处理并记录警告（不能因为一个可选设置的拼写让 juicefs 容器退出、整个站点等待挂载）。
+- **待上传数据块的判断**与 JuiceFS 1.4.1 一致（`pkg/chunk/disk_cache.go` 的 `scanStaging` 与 `openCacheFile`）：只统计 `rawstaging/` 下路径为 `chunks/<数字或两位十六进制>/<数字>/<slice id>_<序号>_<长度>`、`<长度>` 不为 0 的文件；`*.tmp`（未写完，JuiceFS 启动时删除超过 1 分钟的）与其他文件 JuiceFS 同样忽略，不计入。文件比 `<长度>` 短，或超出部分是 4 的倍数但短于校验和（每 32 KiB 4 字节）时，JuiceFS 永远无法上传它（每分钟重试并记录 `Open staging file ...: invalid file size`，从不删除），记为 **stuck**：启动时列出（最多 20 个）并提示恢复方法，但不会因此强制开启写回。整机非正常关机后常见 0 字节的暂存块；若统计 `rawstaging` 下的所有文件，只要有一个这样的文件（或刚崩溃留下的 `.tmp`），`JFS_WRITEBACK=0` 就永远无法生效、「等待待上传为 0」的步骤也永远完成不了。
+- 仍有可上传的数据块而 `JFS_WRITEBACK` 关闭时，本次启动仍加 `--writeback`（JuiceFS 只在写回模式下启动上传线程，否则这些数据块永远不上传）；扫描本身出错时同样按有待上传数据处理。
+- **`pending` 子命令**：`docker compose -f docker-compose.s3.yml exec juicefs sh /juicefs-entrypoint.sh pending` 输出 `pending` / `stuck` 数量与 stuck 文件列表（扫描缓存目录下的所有卷），扫描出错时（例如数据块恰好上传完被删除）退出码 1。
+- **风险**：JuiceFS 写入暂存数据块时不执行 fsync（`flushPage`：write + close + rename），数据块暂存后应用的 fsync 即返回成功，元数据立即提交。整机非正常关机（断电、内核崩溃）时尚未上传的数据块可能丢失或被截断，对应文件读取报 EIO，需要 `juicefs fsck` 并从回收站恢复（步骤见 README）。容器或进程崩溃不受影响。
+
+验证（`juicedata/mount:ce-v1.4.1`，`/bin/sh` 为 dash）：
+
+- 替身 `juicefs`：取值 `TRUE`、` On` + `\r`、`No`、无法识别；`.tmp`、0 字节、截断、带校验和、校验和不完整、带 footer 的数据块，无效文件名、十六进制目录、`<长度>` 为 0；未解析出 UUID 时扫描所有卷；`find` 失败；`pending` 子命令。
+- 真实 JuiceFS 1.4.1（file 存储 + SQLite 元数据，独立容器）：不开写回写入 3 个文件的 v1 → 开写回（`--upload-delay 1h`）按 write-file-atomic 的方式（临时文件 + fsync + rename）写入 v2 → SIGKILL → 把一个暂存块截断为 0 字节并加入一个新的 `.tmp`（旧的统计方式得到 4）→ 在 `JFS_WRITEBACK` 未设置时运行启动脚本：报告 1 个 stuck、2 个待上传并强制写回；两个文件的 v2 逐字节一致，截断的文件读取 EIO，JuiceFS 记录 `Open staging file ...: invalid file size 0, data length 30000`，fsck 列出该文件。按 README 的步骤把回收站中的 v1 用 `mv` 移回原路径、删除回收站中的损坏文件后，JuiceFS 自动删除了 stuck 块，fsck 通过，`pending` 为 0 / 0；再以 `JFS_WRITEBACK=0` 启动时不加 `--writeback`。（用 `cp` 覆盖损坏的文件虽然能读回 v1，但损坏的 slice 在回收站期限内仍留在该 inode 上，fsck 继续报告，所以文档使用 `mv`。）
 
 ## 已移除功能
 

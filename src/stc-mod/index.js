@@ -8,7 +8,8 @@
  * Exports 5 functions called from server-main.js hook points:
  * - configureTrustProxy(app) -> Reverse proxy trust (before cookie-session)
  * - shouldSkipCsrf(req)    -> CSRF exemption check
- * - setupPublicRoutes(app) -> Password-migration gate, QRole password-login gate,
+ * - setupPublicRoutes(app) -> Socket 'close'-listener guard (memory leak fix), data root write guard,
+ *                             password-migration gate, QRole password-login gate,
  *                             QRole session guard, settings.json safeguard, vault store check of
  *                             API key writes, page routes incl. the QRole export-only page
  *                             (before official routes and login middleware)
@@ -47,6 +48,7 @@ import { shouldSkipCsrf as csrfCheck } from './middleware/csrf-exemption.js';
 import { expirationCheckMiddleware } from './middleware/expiration-check.js';
 import { registerStorageEnforceMiddleware } from './middleware/storage-enforce.js';
 import { createDataRootWriteGuard, useRightAfter } from './middleware/data-root-write-guard.js';
+import { createSocketCloseListenerGuard } from './middleware/socket-close-listeners.js';
 import multerMonkeyPatch from '../middleware/multerMonkeyPatch.js';
 import { getUserMeta, isUserExpired } from './user-metadata.js';
 import { isRegistrationEnabled } from './services/registration.js';
@@ -242,7 +244,11 @@ function clearQroleExportOnLogin(req, res, next) {
 let postBodyWriteGuard = null;
 
 export async function setupPublicRoutes(app) {
-    // First of all: refuse data-changing requests (503) while the data root is unavailable, in front
+    // Before any official router: keep Node's own 'close' listeners when an official generation
+    // handler calls req.socket.removeAllListeners('close') (otherwise every closed connection stays
+    // referenced with the whole request, response and upstream stream: memory leak)
+    app.use(createSocketCloseListenerGuard());
+    // Then: refuse data-changing requests (503) while the data root is unavailable, in front
     // of every official and STC router (the official handlers would write under a lost mount)
     app.use(createDataRootWriteGuard());
     // And again right before the official routers: server-main.js registers multer + multerMonkeyPatch

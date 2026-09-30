@@ -26,6 +26,7 @@ LLM Frontend for Power Users
 - [反向代理部署（nginx / OpenResty / Cloudflare）](#反向代理部署nginx--openresty--cloudflare)
 - [STC-MOD 功能概览](#stc-mod-功能概览)
   - [存储配额规则](#存储配额规则)
+  - [流式生成的内存泄漏修复](#流式生成的内存泄漏修复)
 - [升级与二次开发注意事项](#升级与二次开发注意事项)
 - [修改记录 (MODIFICATIONS)](#修改记录-modifications)
 - [上游资源与协议](#上游资源与协议)
@@ -94,6 +95,7 @@ cd ~/sillytavern
 docker run -d \
   --name sillytavernmod \
   --restart unless-stopped \
+  --log-opt max-size=20m --log-opt max-file=5 \
   -p 8000:8000 \
   -v "$PWD/config:/home/node/app/config" \
   -v "$PWD/data:/home/node/app/data" \
@@ -120,6 +122,7 @@ docker run -d \
 - 容器启动时总是带 `--listen` 参数，`config.yaml` 里的 `listen: false` 在 Docker 中不起作用，谁能访问只由 `-p` 决定。
 - 每次启动都会执行 `npm run init`，自动补全 `config.yaml` 中缺失的配置项。
 - `--restart unless-stopped`：Docker 或服务器重启后自动拉起容器（手动 `docker stop` 的除外）。
+- `--log-opt max-size=20m --log-opt max-file=5`：容器日志轮转，最多保留 5 个 20 MB 的日志文件（约 100 MB），旧的自动删除。不加时 Docker 日志在宿主机硬盘上无限增长。方式 B / D 的 Compose 文件已内置同样的设置（`x-logging`）。
 - `config` 与 `data` 不能对调。**不要**把宿主机目录挂载到整个 `/home/node/app/public`，否则会盖住镜像中构建好的前端文件，导致页面空白或版本不一致。
 - 容器默认以 root 运行，宿主机上生成的文件属于 root。希望文件属于普通用户时，在 `docker run` 中加上 `-e PUID=1000 -e PGID=1000`（换成该用户 `id -u` / `id -g` 的结果），启动时会自动调整目录权限（日志 `Mode: PUID/PGID (UID:1000 GID:1000)`）。
 - `docker run` 没有健康检查；方式 B / D 的 Compose 文件自带健康检查。
@@ -284,6 +287,7 @@ Go to: http://127.0.0.1:8000/ to open SillyTavern
 | 存储配额 | STC 管理面板「用户空间」（`userStorage`） | 默认启用，每个用户（包括管理员）上限 50 MiB，超出后新增内容的写入返回 HTTP 507（删除、改名和不增大文件的保存始终允许，见 [存储配额规则](#存储配额规则)）；新账号自带约 15 MiB 默认内容（默认背景图、示例角色等），实际可用约 35 MiB（设置 `newUserContent: minimal` 后新注册账号只带约 80 KB，见 [减少对象存储写入](#6-减少对象存储写入)）；保存后建议重启 |
 | API 密钥保险箱 | `config.yaml` → `privacy.secretsVault.requireForApiKeys`（默认 `true`） | 用户须先在个人面板「API 密钥保险箱」中启用并解锁，才能保存 API 密钥；解锁状态只保存在内存中，服务重启或超过 `privacy.secretsVault.unlockTtlMinutes`（默认 1440 分钟，即 24 小时）后需重新解锁（见 [API 密钥保险箱](#api-密钥保险箱与-requireforapikeys)） |
 | 内网访问防护（可选） | `config.yaml` → `privateAddressWhitelist.enabled: true` | 官方建议在对不受信任的用户开放时启用，阻止服务器代为访问内网地址（本机 `127.0.0.1` 默认放行）；启用后用户无法连接内网中的模型服务 |
+| 日志级别与轮转 | `config.yaml` → `logging.minLogLevel: 1`；Compose 已内置日志轮转，`docker run` 需加 `--log-opt` | 调试级别 `0` 会把每次 AI 生成的完整聊天内容写进日志（隐私 + 占用硬盘），上线时应为 `1`（见 [查看日志](#查看日志)） |
 | 数据存到 S3 | `docker/docker-compose.s3.yml` | 见 [用户数据存储到 S3](#用户数据存储到-s3r2--b2juicefs)；建议同时设置 `skipContentCheck: true` 与 `newUserContent: minimal`（见 [减少对象存储写入](#6-减少对象存储写入)） |
 
 ### 5. STC 管理面板
@@ -384,7 +388,7 @@ docker compose -f docker-compose.s3.yml up -d --build
 | A | `~/sillytavern/` 下的 `config/`、`data/`，以及自行放入的 `plugins/`、`extensions/` |
 | B | `SillyTavernMOD/docker/` 下的 `config/`、`data/`，以及 `plugins/`、`extensions/` |
 | C | 项目根目录的 `config.yaml`、`stc-mod-token.key`（使用 QRole 后台自动复核时生成）、`data/`，以及 `plugins/`、`public/scripts/extensions/third-party/` 中自行安装的扩展 |
-| D（S3 / JuiceFS） | 存储桶 + 元数据库（云 MariaDB / MySQL 用其自带备份；本地 Redis 则备份 `docker/juicefs/redis/`）、`docker/s3.env`、`docker/config/`，以及 `docker/plugins/`、`docker/extensions/`。JuiceFS 每小时还会自动把元数据备份到桶内 `<JFS_NAME>/meta/`，见 [元数据库丢失时的恢复](#5-元数据库丢失时的恢复) |
+| D（S3 / JuiceFS） | 存储桶 + 元数据库（云 MariaDB / MySQL 用其自带备份；本地 Redis 则备份 `docker/juicefs/redis/`）、`docker/s3.env`、`docker/config/`，以及 `docker/plugins/`、`docker/extensions/`。JuiceFS 每小时还会自动把元数据备份到桶内 `<JFS_NAME>/meta/`，见 [元数据库丢失时的恢复](#5-元数据库丢失时的恢复)。开启 [写回缓存](#8-写回缓存可选) 时，最近保存的数据可能还只在本机 `docker/juicefs/cache` 中：备份前先停止 sillytavern 并等待待上传数量为 0 |
 
 `data/` 中包含全部账号、聊天、角色卡和 STC-MOD 数据，建议先停止服务再复制。`config/`（方式 C 为项目根目录）中的 `stc-mod-token.key` 是 QRole 刷新令牌的加密密钥，务必与配置一起备份（丢失只会让 QRole 用户重新登录一次，见 [会员到期后的处理](#会员到期后的处理)）。以方式 A 为例：
 
@@ -402,6 +406,9 @@ docker start sillytavernmod
 | B | 在 `docker/` 目录执行 `docker compose logs -f sillytavern` |
 | C | 前台运行时直接看终端；PM2：`pm2 logs sillytavern` |
 | D | 在 `docker/` 目录执行 `docker compose -f docker-compose.s3.yml logs -f sillytavern juicefs` |
+
+- **日志级别**：`config.yaml` → `logging.minLogLevel`（`0` 调试、`1` 信息、`2` 警告、`3` 错误），默认 `1`。**不要长期设为 `0`**：调试级别会把每次 AI 生成的完整请求（整段聊天上下文，常见 50–130 KB/次）打印到日志中，用户聊天内容以明文留在服务器上，日志也会快速膨胀（每天 100 人各聊 1 小时约增加 0.5–1 GB）。排查问题时可临时改为 `0` 并重启，排查完改回 `1`。
+- **日志轮转**：Compose（方式 B / D）已内置 `max-size: 20m`、`max-file: 5`，每个容器日志最多约 100 MB；方式 A 需在 `docker run` 中加 `--log-opt max-size=20m --log-opt max-file=5`（见上文）；PM2 可安装 `pm2 install pm2-logrotate`。日志配置只在**创建**容器时生效：已有容器需执行 `docker compose up -d`（Compose 检测到配置变化会重建容器）或删除后重新 `docker run`。查看当前容器是否已启用：`docker inspect <容器名> --format '{{json .HostConfig.LogConfig}}'`。
 
 #### 忘记密码
 
@@ -476,6 +483,10 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
 - S3 部署：确认 `juicefs` 容器正常运行，然后执行 `docker compose -f docker-compose.s3.yml restart juicefs sillytavern`；开启看门狗（默认）时 SillyTavern 会在挂载消失后自动退出并重启。
 - 本地部署：检查数据目录的磁盘与权限（`data/stc-mod/` 需要可读写）。存储恢复后无需重启，最多约 5 秒后自动恢复。
 
+**服务器内存随使用持续上涨，只有重启才下降**
+
+- 旧版本中官方流式生成每次都会有约 0.3–0.4 MB 永久留在内存中（连接关闭后也不释放），已由 STC-MOD 修复，更新到包含该修复的版本即可，无需配置，见 [流式生成的内存泄漏修复](#流式生成的内存泄漏修复)。
+
 **端口被占用**
 
 - 方式 C 的日志出现 `Address ... is already in use. Another SillyTavern instance may already be running. Stop the other process or change "port" in config.yaml.`：可能已有另一个 SillyTavern 在运行（例如用 `npm run start` 启动后只结束了 npm 进程，node 子进程仍在监听）。用 `ss -ltnp | grep :8000` 找到占用端口的进程并结束，或修改 `config.yaml` 中的 `port`（也可以 `./start.sh --port 8001`）。
@@ -497,6 +508,8 @@ docker exec -it sillytavernmod node recover.js 用户名 '新密码'   # 方式 
 8. **Docker 用户要手动更新 STC 管理面板**：容器不会覆盖挂载目录中已有的 `stc-admin-panel`，更新镜像后请先删除宿主机上的 `extensions/stc-admin-panel` 再启动容器（见 [更新](#更新)）。
 9. **存储读取错误改为返回 503**：以前 STC 数据文件读取出错时会按空数据处理（例如邀请码列表为空、保险箱显示未启用、用户元数据从空开始并在之后覆盖原文件）。现在返回 503 `STORE_UNAVAILABLE`，数据文件不会被覆盖；数据根目录是单独挂载时，挂载消失、启动时不可访问或无响应时进程会自动退出重启（`stcDataRootWatchdog: false` 可关闭，见 [存储故障保护](#7-存储故障保护)）。
 10. **存储配额规则调整**：超额后删除、改名和不增大文件的保存不再被拦截；占用改为后台异步统计（结果最多延迟约 30 秒，统计失败时不拦截写入），管理面板可能暂时显示「统计中…」（见 [存储配额规则](#存储配额规则)）。
+11. **流式生成的内存泄漏已修复**：以前每次生成的请求、提示词和上游响应在连接关闭后仍留在内存中，服务器内存持续上涨，需要定期重启。升级后自动生效，无需任何操作（见 [流式生成的内存泄漏修复](#流式生成的内存泄漏修复)）。
+12. **默认日志级别改为 `1`（信息），Compose 加入日志轮转**：新安装的 `config.yaml` 为 `logging.minLogLevel: 1`，不再把每次 AI 生成的完整聊天内容打印到日志。**已有的 `config.yaml` 保留原值**，请检查并把 `logging.minLogLevel` 改为 `1` 后重启。`docker/docker-compose.yml`、`docker/docker-compose.s3.yml` 为所有容器加入日志轮转（每个容器最多 5 × 20 MB），更新 Compose 文件后执行 `docker compose up -d` 才会用新配置重建容器；使用 `docker run` 的站点请在重新创建容器时加上 `--log-opt max-size=20m --log-opt max-file=5`（见 [查看日志](#查看日志)）。
 
 ---
 
@@ -509,7 +522,7 @@ SillyTavern 代码无需改动：[JuiceFS](https://juicefs.com/) 把存储桶挂
 |------|----------|------|
 | 存储桶（R2 / B2） | 所有文件内容 | 云端 |
 | 元数据库（推荐云 MariaDB / MySQL） | 目录树、文件名、文件由哪些对象组成、S3 密钥 | 云端（或本地 Redis，见下） |
-| `sillytavernmod-juicefs` 容器 | 挂载卷；本地读缓存 `docker/juicefs/cache`（上限 `JFS_CACHE_SIZE_MIB`） | 本机 |
+| `sillytavernmod-juicefs` 容器 | 挂载卷；本地读缓存 `docker/juicefs/cache`（上限 `JFS_CACHE_SIZE_MIB`；开启 [写回缓存](#8-写回缓存可选) 时还暂存尚未上传的新数据） | 本机 |
 | `sillytavernmod` 容器 | SillyTavern，数据根目录 `/mnt/jfs/fs/data` | 本机 |
 
 ### 1. 准备存储桶、密钥与数据库
@@ -631,6 +644,53 @@ JuiceFS 容器重启时，SillyTavern 容器内的挂载可能消失，同一路
 - **写入保护**：数据根目录不可用（挂载消失、出错或无响应）时，所有改动数据的请求（任意路径的 POST / PUT / PATCH / DELETE，退出登录除外）一律返回 503 `STORE_UNAVAILABLE`，官方处理器（保存聊天、世界书、设置、上传、删除等）根本不会执行，不会在挂载下面的空目录里创建文件。该检查装在两处：所有路由之前，以及官方上传中间件（multer）之后、官方路由之前（大文件上传过程中或 STC 较慢的检查期间挂载消失也能拦住）；配额检查在等待用量统计后也会再检查一次。仍无法覆盖的是官方不经请求的后台写入（例如节流后的聊天备份），看门狗每 5 秒检查一次、请求发现故障后约 1 秒退出，把这段时间压到最短。
 - 官方数据（账号库 `_storage`、各用户目录）不在此范围内：挂载消失后已登录的请求通常直接返回官方的 403，看门狗会在十几秒内重启服务。
 - 兑换存储激活码或邀请码时，若激活码已标记为已使用、但随后保存新的上限 / 到期时间失败（两次写入之间挂载恰好消失），新值会留在内存中稍后重试，同时记录一条带用户名和激活码的错误日志（`... could not be saved yet ...`），接口结果带 `persisted: false`；若进程在重试成功前退出，请按日志手动补上。
+
+### 8. 写回缓存（可选）
+
+默认关闭：每次保存都要等文件上传到存储桶才返回（远程存储桶每个文件约 0.3–0.6 秒，期间整个服务器被阻塞）。开启后保存只写入本机磁盘（`docker/juicefs/cache/<卷 UUID>/rawstaging`），几毫秒即返回，JuiceFS 在后台上传，通常 1 秒内完成（一次保存 200 个文件约几秒）。
+
+**开启 / 关闭**：在 `s3.env` 中设置 `JFS_WRITEBACK=1`（关闭为 `0`），然后重新创建容器（`restart` 不会重新读取 `s3.env`）：
+
+```bash
+docker compose -f docker-compose.s3.yml up -d --force-recreate juicefs sillytavern
+```
+
+- 开启后 `juicefs` 日志中有 `Write-back enabled`。取值不区分大小写：`1` / `true` / `yes` / `on` 为开启，`0` / `false` / `no` / `off` 或不设置为关闭；无法识别的值按关闭处理并记录一条警告，不会导致挂载失败。
+- 关闭时如果还有待上传的数据块，启动脚本本次仍开启写回（JuiceFS 只在写回模式下上传它们），日志中会说明；待上传数量为 0 后再执行一次上面的命令才真正关闭。无法上传的 stuck 数据块（见下）不会让写回保持开启。
+
+**开启前必须了解的风险**：上传完成之前，刚保存的数据只存在于本机磁盘。
+
+- **重启、停止容器，或 JuiceFS / SillyTavern 进程崩溃：不丢数据**。juicefs 用同一个缓存目录再次启动后会继续上传。
+- **整机非正常关机（断电、内核崩溃、强制重启、云主机被强制关停）：可能丢失最近的保存**。JuiceFS 写入待上传的数据块时不执行 fsync，尚未上传的数据块可能丢失或只剩一部分（常见为 0 字节）。受影响的是最后约 1 秒内保存的文件（存储桶变慢或无法访问时最多约 30 秒）：这些文件仍然列出，但读取时报 I/O 错误。SillyTavern 每次保存都整体改写文件，所以损坏的是整个聊天或设置文件，而不只是最后一条消息；上一个版本保留在 JuiceFS 回收站中（`JFS_TRASH_DAYS` 天；设为 0 时没有回收站，无法恢复）。恢复方法见下文。关闭写回时，整机崩溃不会丢失已经保存成功的数据。
+- 有待上传数据时删除 `docker/juicefs/cache`，或本机磁盘损坏：这些文件同样无法读取。**有待上传数据时绝不要删除 `docker/juicefs/cache`**。
+- 缓存盘剩余空间低于 5% 时，JuiceFS 不再暂存而是直接上传（保存重新变慢，不丢数据）。
+- 存储桶无法访问时保存仍然成功，数据堆积在 `rawstaging` 中，恢复访问后自动上传；存储桶故障后请查看待上传数量。
+
+**查看待上传数量**：
+
+```bash
+docker compose -f docker-compose.s3.yml exec juicefs sh /juicefs-entrypoint.sh pending
+```
+
+`pending: 0` 表示全部数据已在存储桶中。`stuck` 是永远无法上传的数据块（整机非正常关机后只剩一部分的数据块），会逐个列出；JuiceFS 每分钟重试一次，日志中记录 `Open staging file ...: invalid file size`，但既不上传也不删除它们。juicefs 停止时可以在宿主机的 `docker/` 目录以 root 执行 `find juicefs/cache/*/rawstaging -type f ! -name '*.tmp' | wc -l`：结果为 0 表示没有待上传数据；它（与监控指标 `juicefs_staging_blocks` 一样）也计入 stuck 数据块。
+
+**备份、迁移到其他服务器、在别处恢复元数据之前**：先停止 sillytavern（`docker compose -f docker-compose.s3.yml stop sillytavern`），等待 `pending: 0`，再停止 juicefs；或者把 `docker/juicefs/cache` 与元数据一起迁移。存储桶 + 元数据库中不包含尚未上传的数据。
+
+**整机非正常关机之后**（开启写回时；juicefs 日志中没有警告也要检查，数据块也可能整个丢失）：
+
+1. 查看 `juicefs` 日志：启动脚本会列出 stuck 数据块（`staged block(s) are incomplete and can never be uploaded`）。
+2. 停止 sillytavern，等待 `pending: 0`（`stuck` 可以不为 0）。
+3. 找出损坏的文件（会列出整个存储桶，文件多时需要一段时间）：
+
+   ```bash
+   docker compose -f docker-compose.s3.yml exec juicefs sh -c 'juicefs fsck "$JFS_META_URL"'
+   ```
+
+   没有损坏时正常结束；有损坏时每个缺失的数据块输出一行 `can't find block ... for file <路径>`，最后是 `N objects are lost (...), M broken files:` 及文件列表。
+4. 以 root 在宿主机的 `docker/juicefs/mnt/fs/` 目录中处理每个损坏的文件（列表中的路径相对于该目录，例如 `/data/<用户>/chats/...`）：
+   - 在 `.trash/<日期-小时>/` 中找到该文件被覆盖前的版本（文件名为 `<父目录 inode>-<inode>-<文件名>`，取崩溃前最新、且不在 fsck 列表中的一个），用 `mv` 把它移回原路径、覆盖损坏的文件；没有旧版本时直接删除损坏的文件。
+   - 被覆盖或删除的损坏文件会进入回收站（`.trash/` 下名为 `<父目录 inode>-<损坏文件的 inode>-<文件名>`），把它也删除；fsck 列表中本来就位于 `/.trash/` 下的文件同样直接删除。删除后 JuiceFS 自动删掉对应的 stuck 数据块。
+5. 再次执行第 3 步，确认没有损坏的文件、`pending` 显示 `stuck: 0` 后启动 sillytavern。仍有 stuck 数据块时：停止 juicefs，把列出的文件从 `docker/juicefs/cache/` 移到其他目录（确认一切正常后再删除），再启动 juicefs 和 sillytavern。
 
 ### 注意事项
 
@@ -1114,6 +1174,7 @@ STC-MOD 的主要能力包括（非完整列表）：
 - 用户「签到扩容」与个人空间使用情况展示。
 - API 密钥保险箱：用户可设置独立保险箱密码，将 API key 加密落盘（防止服务器文件系统直接读取明文）。当前提示与弹窗为简体中文硬编码。
 - STC 管理面板（系统监控、用户管理多选与批量删除、定时任务、不活跃用户清理等，入口与各标签说明见 [STC 管理面板](#5-stc-管理面板)）。
+- 修复官方流式生成的内存泄漏：每次生成的请求、提示词和上游响应在连接关闭后不再永久占用内存（见 [流式生成的内存泄漏修复](#流式生成的内存泄漏修复)）。
 
 所有后端路由均通过 `src/stc-mod/index.js` 注册，前端管理与入口则通过
 `public/scripts/extensions/third-party/stc-admin-panel/` 扩展注入。
@@ -1129,6 +1190,19 @@ STC-MOD 的主要能力包括（非完整列表）：
 - **占用在后台异步统计**，保存前不再同步扫描用户目录：统计结果缓存 10 分钟；成功的写入先预估计入（聊天与世界书按文件增大的字节数，其他按请求大小），约 30 秒内重新统计；删除或改名后约 1.5 秒内重新统计，释放的空间很快生效。仅因预估而超额时会先重新统计再决定是否拒绝。统计同时最多进行 3 个文件操作（Node 默认 4 个 I/O 线程中留出 1 个给其他请求；设置环境变量 `UV_THREADPOOL_SIZE` 可加快统计），不会一次性为每个文件排队。
 - **统计失败（例如存储读取错误）时占用视为「未知」，不会阻止写入**（记录一条日志），不会被当成 0，也不会把用户锁在外面。统计超过 2 分钟仍未完成时不再等待它（尚无结果的用户显示「未知」，已有旧结果的继续使用旧结果），但同一用户不会同时开始第二次统计，完成后的结果照常缓存。个人面板显示「未知」；管理面板的用户列表与存储分析最多等待约 5 秒，尚未统计完的用户显示「统计中…」，稍后刷新即可看到结果。
 - 管理员修改某个用户的上限、重置或删除用户后，该用户的统计缓存会立即失效。
+
+### 流式生成的内存泄漏修复
+
+官方的生成接口（聊天补全、文本补全、Google、Horde、KoboldAI、NovelAI、图片生成等）在每次生成开始时清空连接上的全部 `close` 监听器，以去掉同一连接上一次生成留下的「中止」监听器。这也删掉了 Node 自己用来在连接关闭后释放它的监听器，结果每个关闭的连接连同那次生成的请求、完整提示词和上游响应都永久留在内存中（130 KB 提示词的流式生成约 0.4 MB / 次），服务器内存只增不减，只有重启才下降。
+
+STC-MOD 在所有官方路由之前为每个连接记录 Node 自己的监听器，官方代码清空时只删除应用添加的监听器（上一次生成的中止监听器照旧删除），Node 的监听器保留。无需配置，始终生效；官方文件未修改。客户端在生成过程中断开连接时，照常中止对上游 API 的请求（与官方行为相同）。
+
+验证方式：
+
+- 自动测试 `node src/stc-mod/tests/socket-close-listeners.test.mjs`：真实 HTTP / HTTPS 服务器上的 keep-alive、pipelining、客户端断开即中止上游，以及在子进程中强制 GC 的泄漏对比（150 次流式生成：无修复时 150 个请求全部残留、堆 +42 MB；有修复时 0 个、+0.3 MB）。
+- 在独立测试服务器上（模拟 LLM，130 KB 提示词；1220 次生成各用一个独立连接，400 次复用 10 个 keep-alive 连接）：无修复时 1620 次生成后堆内存从 89 MB 涨到 441 MB，残留 1233 个响应对象；有修复时始终约 81 MB，没有残留。详细数据见 [MODIFICATIONS.md](MODIFICATIONS.md) 的「流式生成的内存泄漏修复」。
+
+在生产环境中可以用 `docker stats`（或 STC 管理面板的系统监控）观察：修复前内存随生成次数持续上涨，修复后在一段时间内趋于稳定。
 
 ---
 

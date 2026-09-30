@@ -1,3 +1,11 @@
+# Container log rotation (docker json-file driver): at most max-file x max-size per container.
+# Without it the logs grow without bound on the host disk shared with every other service.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   sillytavern:
     build: ..
@@ -27,3 +35,4 @@ services:
       retries: 3
 
     restart: unless-stopped
+    logging: *default-logging

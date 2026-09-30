@@ -8,6 +8,14 @@
 #   juicefs     - Mounts the volume at ./juicefs/mnt/fs (file contents in the bucket, file tree in JFS_META_URL).
 #   sillytavern - Uses ./juicefs/mnt/fs/data as its data root.
 #   redis       - Optional (profile "redis"): local metadata engine persisted to ./juicefs/redis.
+# Container log rotation (docker json-file driver): at most max-file x max-size per container.
+# Without it the logs grow without bound on the host disk shared with every other service.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   redis:
     profiles: ["redis"]
@@ -22,6 +30,7 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    logging: *default-logging
 
   juicefs:
     image: juicedata/mount:ce-v1.4.1
@@ -54,6 +63,7 @@ services:
       start_period: 30s
       retries: 3
     restart: unless-stopped
+    logging: *default-logging
 
   sillytavern:
     build: ..
@@ -108,3 +118,4 @@ services:
       retries: 3
 
     restart: unless-stopped
+    logging: *default-logging
