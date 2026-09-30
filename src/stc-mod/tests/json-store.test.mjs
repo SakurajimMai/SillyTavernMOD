@@ -570,6 +570,28 @@ test('watchdog running: a loss observed by a store access is sticky (a same-devi
     assert.equal(checkDataRoot().ok, true);
 });
 
+test('watchdog running: a loss observed by a store access or request exits within about 1 s, not at the next check', async (t) => {
+    quiet(t);
+    const guard = mountedGuard();
+    let resolveExit;
+    const exited = new Promise(resolve => { resolveExit = resolve; });
+    const exits = [];
+    const watchdog = startDataRootWatchdog({
+        intervalMs: 60_000, // the next regular check is far away
+        exit: (code) => { exits.push(code); resolveExit(); },
+        statAsync: async () => ({ dev: 7 }),
+    });
+    t.after(() => watchdog?.stop());
+    const started = Date.now();
+    guard.setDev(null);
+    assert.equal(checkDataRoot().ok, false);
+    await keepAlive(exited);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(exits, [1]);
+    assert.ok(elapsed >= 900 && elapsed < 3000, `exited after ${elapsed} ms`);
+    watchdog.stop();
+});
+
 test('watchdog worker thread: a device change is reported to the main thread, which exits(1); stop() ends the worker', async (t) => {
     quiet(t);
     mountedGuard(); // the guard recorded dev 7; the worker stats the real data root (another device)

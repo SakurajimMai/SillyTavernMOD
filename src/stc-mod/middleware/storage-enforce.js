@@ -34,6 +34,7 @@ import sanitize from 'sanitize-filename';
 import { forbiddenRegExp } from '../../middleware/validateFileName.js';
 import { isPathUnderParent } from '../../util.js';
 import { getUserDirectories } from '../../users.js';
+import { assertDataRootAvailable, isStoreUnavailableError, sendStoreUnavailable } from '../services/json-store.js';
 import {
     ENFORCE_WAIT_MS,
     getUserStorageInfoAsync,
@@ -393,6 +394,7 @@ export function createStorageEnforceMiddleware({
     readFile = p => fs.promises.readFile(p),
     getDirectories = getUserDirectories,
     logger = console,
+    assertAvailable = assertDataRootAvailable,
 } = {}) {
     /** @type {Map<string, number>} */
     const lastUnknownLog = new Map();
@@ -497,9 +499,21 @@ export function createStorageEnforceMiddleware({
 
         let decision;
         try {
+            // Also checked by the data root write guard in front of every router; repeated here so a
+            // quota-relevant write can never reach the official handler while the data root is gone
+            assertAvailable();
             decision = await decide(req, res, kind);
+            // decide() may wait for a usage count (up to ENFORCE_WAIT_MS, twice when recounting): the
+            // mount can be lost meanwhile, so check again right before handing over to the handler
+            if (!decision.block && !decision.answered) assertAvailable();
         } catch (error) {
-            // The quota must not lock users out because of an internal / remote read error
+            if (isStoreUnavailableError(error)) {
+                // Store or data root unavailable (e.g. lost mount): the official handlers have no such
+                // check and could create files in the empty directory under the mount, so never pass on
+                return sendStoreUnavailable(req, res);
+            }
+            // Any other internal error: the quota must not lock users out (an unreadable usage count
+            // does not get here, it is reported as unknown usage and never blocks)
             logFailure(req, error);
             decision = { block: false };
         }

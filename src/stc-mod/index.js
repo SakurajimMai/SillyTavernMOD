@@ -46,6 +46,8 @@ import { configureTrustProxy as applyTrustProxy } from './middleware/trust-proxy
 import { shouldSkipCsrf as csrfCheck } from './middleware/csrf-exemption.js';
 import { expirationCheckMiddleware } from './middleware/expiration-check.js';
 import { registerStorageEnforceMiddleware } from './middleware/storage-enforce.js';
+import { createDataRootWriteGuard, useRightAfter } from './middleware/data-root-write-guard.js';
+import multerMonkeyPatch from '../middleware/multerMonkeyPatch.js';
 import { getUserMeta, isUserExpired } from './user-metadata.js';
 import { isRegistrationEnabled } from './services/registration.js';
 import { runPasswordMigrationOnce } from './services/password-migration.js';
@@ -236,7 +238,17 @@ function clearQroleExportOnLogin(req, res, next) {
  * Called BEFORE the official login page route, so our routes take priority.
  * @param {import('express').Express} app
  */
+/** Second write guard, added right after the official upload middleware (see setupPublicRoutes). */
+let postBodyWriteGuard = null;
+
 export async function setupPublicRoutes(app) {
+    // First of all: refuse data-changing requests (503) while the data root is unavailable, in front
+    // of every official and STC router (the official handlers would write under a lost mount)
+    app.use(createDataRootWriteGuard());
+    // And again right before the official routers: server-main.js registers multer + multerMonkeyPatch
+    // after this hook, so the check also runs after a multipart body arrived / slow STC checks
+    postBodyWriteGuard = useRightAfter(app, multerMonkeyPatch, createDataRootWriteGuard());
+
     // Hold requests until passwordless OAuth accounts have been secured (runs once;
     // node-persist is initialized before the server accepts requests). The migration
     // promise never rejects; either way the request continues.
@@ -381,6 +393,12 @@ export async function setupPublicApi(app) {
  * @param {import('express').Express} app
  */
 export async function setupPrivateRoutes(app) {
+    // The official routers are registered by now: the second write guard must be in place
+    if (postBodyWriteGuard && !postBodyWriteGuard.installed()) {
+        postBodyWriteGuard.restore();
+        console.warn('[STC-MOD] Could not place the data root write guard after the official upload middleware (multerMonkeyPatch not registered as expected); only the first guard is active');
+    }
+
     // User expiration check middleware for all STC private routes
     app.use('/api/stc', expirationCheckMiddleware);
 

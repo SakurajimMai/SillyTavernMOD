@@ -25,7 +25,7 @@
  * FUSE mount /mnt/jfs/fs). While that is the case, every store read / write first checks that the
  * data root can still be stat'ed and has the same device id; otherwise StoreUnavailableError. A data
  * root that cannot be stat'ed at startup (other than ENOENT) is unusable until the next start.
- * The watchdog (a worker thread, see data-root-watchdog.js) checks the same every 15 s and exits
+ * The watchdog (a worker thread, see data-root-watchdog.js) checks the same every 5 s and exits
  * the process on loss (Docker restarts the container; its entrypoint waits for the mount again); a
  * hung mount is killed with SIGKILL. While it runs, a loss observed by a store access is sticky: a
  * mount that comes back with the same device id (Linux reuses it) is not trusted again.
@@ -67,10 +67,19 @@ import {
 export const STORE_UNAVAILABLE_CODE = 'STORE_UNAVAILABLE';
 export const STORE_UNAVAILABLE_MESSAGE = '数据存储暂时不可用，请稍后重试';
 
-/** Watchdog check interval (ms). */
-export const DATA_ROOT_WATCHDOG_INTERVAL_MS = 15_000;
+/**
+ * Watchdog check interval (ms). Short, because official background writers (e.g. the throttled chat
+ * backup) can write under a lost mount until the process exits; a check is one stat in a worker thread.
+ */
+export const DATA_ROOT_WATCHDOG_INTERVAL_MS = 5_000;
 /** A watchdog stat that has not returned after this long counts as a lost data root (hung FUSE mount). */
-const WATCHDOG_STALL_MS = 4 * DATA_ROOT_WATCHDOG_INTERVAL_MS;
+const WATCHDOG_STALL_MS = 60_000;
+/**
+ * A loss observed by a store access or a request (markLost) exits after this delay: long enough to
+ * send the 503 answers of the requests that observed it, short enough to leave official background
+ * writers almost no time to write under the lost mount.
+ */
+const MARK_LOST_EXIT_DELAY_MS = 1000;
 /** After a loss, the watchdog worker kills the process when it has not exited this much later. */
 const WATCHDOG_EXIT_GRACE_MS = 10_000;
 /**
@@ -340,7 +349,7 @@ let watchdog = null;
 let sharedFlags = null;
 
 /**
- * Start the data root watchdog (only when the data root was a mount at startup): every 15 s the
+ * Start the data root watchdog (only when the data root was a mount at startup): every 5 s the
  * data root is stat'ed asynchronously; when it is gone or has another device id, an error is logged,
  * all STC stores are blocked for good and the process exits with 1. A stat that hangs for 60 s (hung
  * FUSE mount) is logged and the process is killed with SIGKILL (process.exit would wait for the
@@ -412,7 +421,9 @@ export function startDataRootWatchdog({
         if (stopped || state.lostReason) return;
         state.lostReason = reason;
         if (sharedFlags) Atomics.store(sharedFlags, SHARED_LOST_AT, BigInt(Math.round(epochNow())));
-        console.error(`[STC-MOD] Data root lost: ${reason}. Exiting at the next watchdog check (within ${Math.round(intervalMs / 1000)} s) so that the container restarts and waits for the mount again (config.yaml stcDataRootWatchdog: false disables this); the STC stores stay blocked until then.`);
+        console.error(`[STC-MOD] Data root lost: ${reason}. Exiting in about ${Math.round(MARK_LOST_EXIT_DELAY_MS / 1000)} s so that the container restarts and waits for the mount again (config.yaml stcDataRootWatchdog: false disables this); the STC stores and data-changing requests are refused until then.`);
+        const exitTimer = setTimeout(() => lose(reason), MARK_LOST_EXIT_DELAY_MS);
+        exitTimer.unref?.();
     };
 
     const startInProcess = () => {
@@ -885,7 +896,16 @@ export function isPlainObject(value) {
  * @returns {boolean}
  */
 function wantsJson(req) {
-    const url = String(req?.originalUrl ?? req?.url ?? '');
+    // originalUrl keeps the full path inside mounted routers (req.path would be router-relative);
+    // an absolute-form request target (http://host/api/x) is reduced to its path
+    let url = String(req?.originalUrl ?? req?.url ?? '');
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+        try {
+            url = new URL(url).pathname;
+        } catch {
+            // Keep the raw value
+        }
+    }
     if (/^\/+api\//i.test(url)) return true;
     if (req?.xhr) return true;
     const accept = String(req?.headers?.accept ?? '');
